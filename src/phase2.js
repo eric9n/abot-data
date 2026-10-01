@@ -319,6 +319,16 @@ export function createPhase2(api) {
     }
   }
 
+  function assertBearerToken(value) {
+    if (typeof value !== "string" || value.length < 1 || value.length > 500) {
+      throw new RpcError(-32602, "bearer_token is invalid");
+    }
+    if (/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/.test(value)) {
+      throw new RpcError(-32602, "bearer_token is invalid");
+    }
+    return value;
+  }
+
   function assertWebhookUrl(value) {
     if (typeof value !== "string" || value.length < 1 || value.length > 500) {
       throw new RpcError(-32602, "webhook url is invalid");
@@ -409,6 +419,26 @@ export function createPhase2(api) {
   function readPollAudience(args) {
     if (!has(args, "audience")) return null;
     return requireAudience(args.audience);
+  }
+
+  async function ensureWebhookAuthColumn(deps) {
+    const rows = await queryAll(
+      deps,
+      "SELECT name FROM pragma_table_info('subscriptions') WHERE name = 'webhook_auth'",
+      [],
+    );
+    if (rows.length > 0) return;
+    try {
+      await queryRun(
+        deps,
+        "ALTER TABLE subscriptions ADD COLUMN webhook_auth TEXT NOT NULL DEFAULT 'hmac'",
+        [],
+      );
+    } catch (err) {
+      const message = err && err.message ? String(err.message) : String(err);
+      if (/duplicate column/i.test(message)) return;
+      throw err;
+    }
   }
 
   async function ensureAudienceColumn(deps) {
@@ -688,6 +718,7 @@ WHERE status = 'pending' AND not_before <= ? AND leased_until IS NOT NULL AND le
       status: row.status,
       url: row.url ?? null,
       event_types: eventTypes,
+      webhook_auth: row.webhook_auth === "bearer" ? "bearer" : "hmac",
       has_secret: row.has_secret === 1 || row.has_secret === true,
       watch_heartbeat: row.watch_heartbeat === 1 || row.watch_heartbeat === true,
       agent_id: row.agent_id,
@@ -696,7 +727,7 @@ WHERE status = 'pending' AND not_before <= ? AND leased_until IS NOT NULL AND le
     };
   }
 
-  const SUB_VIEW_SQL = `SELECT id, mode, status, url, event_types,
+  const SUB_VIEW_SQL = `SELECT id, mode, status, url, event_types, webhook_auth,
   CASE WHEN secret_sealed IS NULL THEN 0 ELSE 1 END AS has_secret,
   watch_heartbeat, agent_id, created_at, updated_at
 FROM subscriptions`;
@@ -711,6 +742,7 @@ FROM subscriptions`;
     const visibility = readVisibility(args.visibility_seconds);
     const audience = readPollAudience(args);
     const cursor = decodeCursor(has(args, "cursor") ? args.cursor : null);
+    await ensureWebhookAuthColumn(deps);
     const sub = await queryFirst(deps, `${SUB_VIEW_SQL} WHERE id = ?`, [args.subscription_id]);
     if (!sub) throw notFound();
     if (sub.status === "paused") throw new RpcError(-32602, "subscription paused");
@@ -834,19 +866,24 @@ ON CONFLICT(agent_id) DO UPDATE SET
 
   async function createSubscription(args, deps) {
     requireArgs(args);
-    assertOnlyKeys(args, new Set(["mode", "url", "event_types", "watch_heartbeat", "agent_id"]));
+    assertOnlyKeys(args, new Set(["mode", "url", "event_types", "watch_heartbeat", "agent_id", "bearer_token"]));
     if (!has(args, "mode")) throw new RpcError(-32602, "mode is required");
     if (args.mode !== "poll" && args.mode !== "webhook") throw new RpcError(-32602, "mode must be poll or webhook");
     const eventTypes = normalizeEventTypes(has(args, "event_types") ? args.event_types : null, { allowDefault: true });
     const watch = readWatch(has(args, "watch_heartbeat") ? args.watch_heartbeat : null, 1);
     const agentId = readAgent(has(args, "agent_id") ? args.agent_id : null, "bot:main");
     let url = null;
+    let bearerToken = null;
     if (args.mode === "poll") {
       if (has(args, "url")) throw new RpcError(-32602, "url is not allowed");
+      if (has(args, "bearer_token")) throw new RpcError(-32602, "bearer_token is not allowed");
     } else {
       if (!has(args, "url") || args.url == null || args.url === "") throw new RpcError(-32602, "url is required");
       url = assertWebhookUrl(args.url);
+      if (has(args, "bearer_token")) bearerToken = assertBearerToken(args.bearer_token);
     }
+    const webhookAuth = bearerToken == null ? "hmac" : "bearer";
+    await ensureWebhookAuthColumn(deps);
     const now = nowIso(deps);
     for (let attempt = 0; attempt < 5; attempt++) {
       const id = newId("sub_");
@@ -854,19 +891,19 @@ ON CONFLICT(agent_id) DO UPDATE SET
       let sealed = null;
       if (args.mode === "webhook") {
         const key = requireSeal(deps);
-        secret = newWebhookSecret();
+        secret = bearerToken == null ? newWebhookSecret() : bearerToken;
         sealed = await sealSecret(secret, id, key);
       }
       try {
         await queryRun(
           deps,
           `INSERT INTO subscriptions (
-            id, mode, status, url, event_types, secret_sealed, watch_heartbeat, agent_id, created_at, updated_at
-          ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
-          [id, args.mode, url, eventTypes, sealed, watch, agentId, now, now],
+            id, mode, status, url, event_types, secret_sealed, webhook_auth, watch_heartbeat, agent_id, created_at, updated_at
+          ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [id, args.mode, url, eventTypes, sealed, webhookAuth, watch, agentId, now, now],
         );
         const out = { id, mode: args.mode, status: "active" };
-        if (secret) out.secret = secret;
+        if (webhookAuth === "hmac" && secret) out.secret = secret;
         return out;
       } catch (err) {
         if (!isUniqueError(err)) throw err;
@@ -879,6 +916,7 @@ ON CONFLICT(agent_id) DO UPDATE SET
     requireArgs(args);
     assertOnlyKeys(args, new Set(["id"]));
     const id = requireId(args.id, "sub_");
+    await ensureWebhookAuthColumn(deps);
     const row = await queryFirst(deps, `${SUB_VIEW_SQL} WHERE id = ?`, [id]);
     if (!row) throw notFound();
     return subscriptionView(row);
@@ -888,6 +926,7 @@ ON CONFLICT(agent_id) DO UPDATE SET
     requireArgs(args);
     assertOnlyKeys(args, new Set(["limit"]));
     const limit = clampLimit(args.limit, 20, 100);
+    await ensureWebhookAuthColumn(deps);
     const rows = await queryAll(
       deps,
       `${SUB_VIEW_SQL}
@@ -933,6 +972,7 @@ LIMIT ?`,
       params.push(readAgent(args.agent_id, null));
     }
     if (sets.length === 0) throw new RpcError(-32602, "no fields to update");
+    await ensureWebhookAuthColumn(deps);
     const now = nowIso(deps);
     sets.push("updated_at = ?");
     params.push(now, id);
@@ -975,16 +1015,24 @@ WHERE subscription_id = ? AND state IN ('due', 'inflight', 'paused')`,
 
   async function rotateSubscriptionSecret(args, deps) {
     requireArgs(args);
-    assertOnlyKeys(args, new Set(["id"]));
+    assertOnlyKeys(args, new Set(["id", "bearer_token"]));
     const id = requireId(args.id, "sub_");
-    const existing = await queryFirst(deps, "SELECT id, mode FROM subscriptions WHERE id = ?", [id]);
+    await ensureWebhookAuthColumn(deps);
+    const existing = await queryFirst(deps, "SELECT id, mode, webhook_auth FROM subscriptions WHERE id = ?", [id]);
     if (!existing) throw notFound();
     if (existing.mode !== "webhook") throw new RpcError(-32602, "subscription has no webhook secret");
+    const bearer = existing.webhook_auth === "bearer";
+    if (bearer) {
+      if (!has(args, "bearer_token")) throw new RpcError(-32602, "bearer_token is required");
+    } else if (has(args, "bearer_token")) {
+      throw new RpcError(-32602, "bearer_token is not allowed");
+    }
     const key = requireSeal(deps);
-    const secret = newWebhookSecret();
+    const secret = bearer ? assertBearerToken(args.bearer_token) : newWebhookSecret();
     const sealed = await sealSecret(secret, id, key);
     const now = nowIso(deps);
     await queryRun(deps, "UPDATE subscriptions SET secret_sealed = ?, updated_at = ? WHERE id = ?", [sealed, now, id]);
+    if (bearer) return { id };
     return { id, secret };
   }
 
@@ -1148,8 +1196,9 @@ WHERE state = 'inflight' AND inflight_at IS NOT NULL AND inflight_at <= ?`,
       "SELECT id, type, payload, dedupe_key, created_at, not_before, status FROM events WHERE id = ?",
       [delivery.event_id],
     );
+    await ensureWebhookAuthColumn(db);
     const subscription = await db.queryFirst(
-      "SELECT id, mode, status, url, secret_sealed FROM subscriptions WHERE id = ?",
+      "SELECT id, mode, status, url, secret_sealed, webhook_auth FROM subscriptions WHERE id = ?",
       [delivery.subscription_id],
     );
     return { db, delivery, event, subscription };
@@ -1246,7 +1295,25 @@ WHERE id = ?`,
     }
     const bodyText = buildWebhookBody(ctx.event);
     const timestamp = String(Math.floor(nowMs / 1000));
-    const signature = await signWebhook(secret, timestamp, bodyText);
+    const bearer = sub.webhook_auth === "bearer";
+    const signature = bearer ? null : await signWebhook(secret, timestamp, bodyText);
+    const headers = bearer
+      ? {
+          "content-type": "application/json; charset=utf-8",
+          authorization: `Bearer ${secret}`,
+          "user-agent": "abot-data-webhook/1",
+          "x-abot-timestamp": timestamp,
+          "x-abot-event-id": ctx.event.id,
+          "x-abot-subscription-id": sub.id,
+        }
+      : {
+          "content-type": "application/json; charset=utf-8",
+          "user-agent": "abot-data-webhook/1",
+          "x-abot-timestamp": timestamp,
+          "x-abot-event-id": ctx.event.id,
+          "x-abot-subscription-id": sub.id,
+          "x-abot-signature": `v1=${signature}`,
+        };
     const fetchImpl = deps.fetch || fetch;
     let response;
     try {
@@ -1254,14 +1321,7 @@ WHERE id = ?`,
         method: "POST",
         redirect: "manual",
         signal: AbortSignal.timeout(10_000),
-        headers: {
-          "content-type": "application/json; charset=utf-8",
-          "user-agent": "abot-data-webhook/1",
-          "x-abot-timestamp": timestamp,
-          "x-abot-event-id": ctx.event.id,
-          "x-abot-subscription-id": sub.id,
-          "x-abot-signature": `v1=${signature}`,
-        },
+        headers,
         body: bodyText,
       });
     } catch (err) {
@@ -1427,7 +1487,8 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     },
     {
       name: "create_subscription",
-      description: "创建 poll 或 webhook 订阅。webhook 的 secret 只在这次响应里出现。",
+      description:
+        "创建 poll 或 webhook 订阅。不传 bearer_token 时 webhook 用 HMAC：服务端生成 secret，只在这次响应里出现。传入 bearer_token 时投递带 Authorization: Bearer，token 不回显。bearer_token 仅 webhook 可用，1 到 500 字符，不能含控制字符或换行。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1436,6 +1497,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
           event_types: { type: "array", items: { type: "string" } },
           watch_heartbeat: { type: "boolean" },
           agent_id: { type: "string" },
+          bearer_token: { type: "string", minLength: 1, maxLength: 500 },
         },
         required: ["mode"],
         additionalProperties: false,
@@ -1443,7 +1505,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     },
     {
       name: "get_subscription",
-      description: "读取一条订阅。不含密钥。未找到是 not found。",
+      description: "读取一条订阅。返回 webhook_auth，不含密钥。未找到是 not found。",
       inputSchema: {
         type: "object",
         properties: { id: { type: "string" } },
@@ -1453,7 +1515,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     },
     {
       name: "list_subscriptions",
-      description: "按 created_at、id 升序列出订阅。limit 默认 20，最大 100。不含密钥。",
+      description: "按 created_at、id 升序列出订阅。limit 默认 20，最大 100。返回 webhook_auth，不含密钥。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1491,10 +1553,14 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     },
     {
       name: "rotate_subscription_secret",
-      description: "轮换 webhook 订阅密钥。新密钥只在这次响应里出现。poll 订阅会拒绝。",
+      description:
+        "轮换 webhook 密钥。先看 webhook_auth：hmac 由服务端生成新 secret，只在这次响应里出现；bearer 必须传新的 bearer_token，且不回显。poll 订阅会拒绝。",
       inputSchema: {
         type: "object",
-        properties: { id: { type: "string" } },
+        properties: {
+          id: { type: "string" },
+          bearer_token: { type: "string", minLength: 1, maxLength: 500 },
+        },
         required: ["id"],
         additionalProperties: false,
       },

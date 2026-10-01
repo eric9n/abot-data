@@ -737,6 +737,8 @@ test("phase 2 schema appends four tables and reapplies without dropping rows", (
   assert.match(sql, /CREATE TABLE IF NOT EXISTS subscriptions/);
   assert.match(sql, /CREATE TABLE IF NOT EXISTS deliveries/);
   assert.match(sql, /CREATE TABLE IF NOT EXISTS heartbeats/);
+  assert.match(sql, /^-- abot-data v1\. Safe to re-run\. Does not touch the mail archive\.\nCREATE TABLE/);
+  assert.match(sql, /secret_sealed TEXT,\n  webhook_auth TEXT NOT NULL DEFAULT 'hmac',\n  watch_heartbeat/);
   assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_open/);
   const db = new DatabaseSync(":memory:");
   db.exec(sql);
@@ -1473,4 +1475,282 @@ test("health and create_contact keep their phase 1 shapes", async () => {
     PHASE1_TOOL_NAMES,
   );
   assert.deepEqual(TOOLS.map((tool) => tool.name).slice(15), PHASE2_TOOL_NAMES);
+});
+
+test("webhook delivery uses bearer authorization or leaves hmac headers unchanged", async () => {
+  const { db, env } = sqliteEnv();
+  const hmacSub = unwrap(
+    await mcp(env, "create_subscription", {
+      mode: "webhook",
+      url: "https://example.com/hmac",
+      event_types: ["*"],
+    }),
+  );
+  const token = "n8n-hook-token";
+  const bearerSub = unwrap(
+    await mcp(env, "create_subscription", {
+      mode: "webhook",
+      url: "https://example.com/bearer",
+      event_types: ["*"],
+      bearer_token: token,
+    }),
+  );
+  assert.equal(Object.hasOwn(bearerSub, "secret"), false);
+  assert.equal(JSON.stringify(bearerSub).includes(token), false);
+  const ev = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:auth:2026-09-30T00:00:00.000Z",
+    }),
+  );
+  const deliveries = db.prepare("SELECT id, subscription_id FROM deliveries WHERE event_id = ?").all(ev.id);
+  const seen = new Map();
+  for (const delivery of deliveries) {
+    await consumeDelivery({ body: { delivery_id: delivery.id } }, env, {
+      nowMs: NOW,
+      fetch: async (url, init) => {
+        seen.set(delivery.subscription_id, { url, headers: init.headers, body: init.body });
+        return new Response("ok", { status: 200 });
+      },
+    });
+  }
+  const hmacHit = seen.get(hmacSub.id);
+  assert.equal(hmacHit.url, "https://example.com/hmac");
+  assert.equal(hmacHit.headers["content-type"], "application/json; charset=utf-8");
+  assert.equal(hmacHit.headers["user-agent"], "abot-data-webhook/1");
+  assert.equal(hmacHit.headers["x-abot-timestamp"], String(Math.floor(NOW / 1000)));
+  assert.equal(hmacHit.headers["x-abot-event-id"], ev.id);
+  assert.equal(hmacHit.headers["x-abot-subscription-id"], hmacSub.id);
+  assert.equal(hmacHit.headers.authorization, undefined);
+  assert.equal(
+    await verifyWebhookRequest({
+      secret: hmacSub.secret,
+      timestamp: hmacHit.headers["x-abot-timestamp"],
+      body: hmacHit.body,
+      signature: hmacHit.headers["x-abot-signature"],
+      nowMs: NOW,
+    }),
+    true,
+  );
+  const bearerHit = seen.get(bearerSub.id);
+  assert.equal(bearerHit.url, "https://example.com/bearer");
+  assert.deepEqual(bearerHit.headers, {
+    "content-type": "application/json; charset=utf-8",
+    authorization: `Bearer ${token}`,
+    "user-agent": "abot-data-webhook/1",
+    "x-abot-timestamp": String(Math.floor(NOW / 1000)),
+    "x-abot-event-id": ev.id,
+    "x-abot-subscription-id": bearerSub.id,
+  });
+  assert.equal(Object.hasOwn(bearerHit.headers, "x-abot-signature"), false);
+  assert.equal(bearerHit.body.includes(token), false);
+  const sealed = db.prepare("SELECT secret_sealed FROM subscriptions WHERE id = ?").get(bearerSub.id).secret_sealed;
+  assert.equal(sealed.includes(token), false);
+});
+
+test("bearer_token is rejected when empty, too long, containing a newline, or set on poll", async () => {
+  const { db, env } = sqliteEnv();
+  const cases = ["", "x".repeat(501), "good\nbad", "good\rbad", "good\u0000bad", "good\u2028bad", "\t"];
+  for (const bearer_token of cases) {
+    const rejected = rpcError(
+      await mcp(env, "create_subscription", {
+        mode: "webhook",
+        url: "https://example.com/hook",
+        bearer_token,
+      }),
+    );
+    assert.equal(rejected.code, -32602, JSON.stringify(bearer_token));
+  }
+  const accepted = unwrap(
+    await mcp(env, "create_subscription", {
+      mode: "webhook",
+      url: "https://example.com/hook",
+      bearer_token: "x".repeat(500),
+    }),
+  );
+  assert.equal(Object.hasOwn(accepted, "secret"), false);
+  assert.equal(JSON.stringify(accepted).includes("x".repeat(500)), false);
+  const before = countOf(db, "subscriptions");
+  const poll = rpcError(
+    await mcp(env, "create_subscription", { mode: "poll", bearer_token: "n8n-token" }),
+  );
+  assert.equal(poll.code, -32602);
+  assert.equal(countOf(db, "subscriptions"), before);
+});
+
+test("rotate_subscription_secret keeps server secrets for hmac and caller tokens for bearer", async () => {
+  const { db, env } = sqliteEnv();
+  const hmacSub = unwrap(
+    await mcp(env, "create_subscription", {
+      mode: "webhook",
+      url: "https://example.com/hmac",
+      event_types: ["*"],
+    }),
+  );
+  const hmacExtra = rpcError(
+    await mcp(env, "rotate_subscription_secret", { id: hmacSub.id, bearer_token: "not-used" }),
+  );
+  assert.equal(hmacExtra.code, -32602);
+  const hmacRotated = unwrap(await mcp(env, "rotate_subscription_secret", { id: hmacSub.id }));
+  assert.match(hmacRotated.secret, /^whsec_[A-Za-z0-9+/]+=*$/);
+  assert.notEqual(hmacRotated.secret, hmacSub.secret);
+  assert.deepEqual(Object.keys(hmacRotated).sort(), ["id", "secret"]);
+
+  const firstToken = "n8n-token-one";
+  const nextToken = "n8n-token-two";
+  const bearerSub = unwrap(
+    await mcp(env, "create_subscription", {
+      mode: "webhook",
+      url: "https://example.com/bearer",
+      event_types: ["*"],
+      bearer_token: firstToken,
+    }),
+  );
+  const missing = rpcError(await mcp(env, "rotate_subscription_secret", { id: bearerSub.id }));
+  assert.equal(missing.code, -32602);
+  const invalid = rpcError(
+    await mcp(env, "rotate_subscription_secret", { id: bearerSub.id, bearer_token: "new\ntoken" }),
+  );
+  assert.equal(invalid.code, -32602);
+  const bearerRotated = unwrap(
+    await mcp(env, "rotate_subscription_secret", { id: bearerSub.id, bearer_token: nextToken }),
+  );
+  assert.deepEqual(bearerRotated, { id: bearerSub.id });
+  assert.equal(JSON.stringify(bearerRotated).includes(nextToken), false);
+
+  const ev = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:rotate:2026-09-30T00:00:00.000Z",
+    }),
+  );
+  const deliveries = db.prepare("SELECT id, subscription_id FROM deliveries WHERE event_id = ?").all(ev.id);
+  const headers = new Map();
+  for (const delivery of deliveries) {
+    await consumeDelivery({ body: { delivery_id: delivery.id } }, env, {
+      nowMs: NOW,
+      fetch: async (_url, init) => {
+        headers.set(delivery.subscription_id, init.headers);
+        return new Response("ok", { status: 200 });
+      },
+    });
+  }
+  assert.equal(
+    await verifyWebhookRequest({
+      secret: hmacRotated.secret,
+      timestamp: headers.get(hmacSub.id)["x-abot-timestamp"],
+      body: buildWebhookBody({
+        id: ev.id,
+        type: "reminder.medication",
+        dedupe_key: "reminder.medication:rotate:2026-09-30T00:00:00.000Z",
+        created_at: NOW_ISO,
+        not_before: NOW_ISO,
+        payload: {},
+      }),
+      signature: headers.get(hmacSub.id)["x-abot-signature"],
+      nowMs: NOW,
+    }),
+    true,
+  );
+  assert.equal(headers.get(hmacSub.id).authorization, undefined);
+  assert.equal(headers.get(bearerSub.id).authorization, `Bearer ${nextToken}`);
+  assert.equal(headers.get(bearerSub.id)["x-abot-signature"], undefined);
+});
+
+test("subscription views include webhook_auth and never return the token", async () => {
+  const { db, env } = sqliteEnv();
+  const column = db.prepare("PRAGMA table_info(subscriptions)").all().find((row) => row.name === "webhook_auth");
+  assert.equal(column.notnull, 1);
+  assert.equal(column.dflt_value, "'hmac'");
+  const token = "n8n-view-token";
+  const hmacSub = unwrap(
+    await mcp(env, "create_subscription", { mode: "webhook", url: "https://example.com/hmac", event_types: ["*"] }),
+  );
+  const bearerSub = unwrap(
+    await mcp(env, "create_subscription", {
+      mode: "webhook",
+      url: "https://example.com/bearer",
+      event_types: ["*"],
+      bearer_token: token,
+    }),
+  );
+  const pollSub = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }));
+  const hmacView = unwrap(await mcp(env, "get_subscription", { id: hmacSub.id }));
+  const bearerView = unwrap(await mcp(env, "get_subscription", { id: bearerSub.id }));
+  const pollView = unwrap(await mcp(env, "get_subscription", { id: pollSub.id }));
+  assert.equal(hmacView.webhook_auth, "hmac");
+  assert.equal(hmacView.has_secret, true);
+  assert.equal(bearerView.webhook_auth, "bearer");
+  assert.equal(bearerView.has_secret, true);
+  assert.equal(pollView.webhook_auth, "hmac");
+  assert.equal(pollView.has_secret, false);
+  for (const view of [hmacView, bearerView, pollView]) {
+    assert.equal(Object.hasOwn(view, "secret"), false);
+    assert.equal(Object.hasOwn(view, "bearer_token"), false);
+    assert.equal(Object.hasOwn(view, "secret_sealed"), false);
+  }
+  assert.equal(JSON.stringify(hmacView).includes(hmacSub.secret), false);
+  assert.equal(JSON.stringify(bearerView).includes(token), false);
+  const listed = unwrap(await mcp(env, "list_subscriptions", { limit: 20 }));
+  const byId = new Map(listed.map((row) => [row.id, row]));
+  assert.equal(byId.get(hmacSub.id).webhook_auth, "hmac");
+  assert.equal(byId.get(bearerSub.id).webhook_auth, "bearer");
+  assert.equal(byId.get(pollSub.id).webhook_auth, "hmac");
+  assert.equal(byId.get(bearerSub.id).has_secret, true);
+  const listedText = JSON.stringify(listed);
+  assert.equal(listedText.includes(token), false);
+  assert.equal(listedText.includes(hmacSub.secret), false);
+  const createTool = TOOLS.find((tool) => tool.name === "create_subscription");
+  const rotateTool = TOOLS.find((tool) => tool.name === "rotate_subscription_secret");
+  assert.match(createTool.description, /bearer_token/);
+  assert.match(rotateTool.description, /bearer_token/);
+  assert.equal(createTool.inputSchema.properties.bearer_token.maxLength, 500);
+  assert.equal(rotateTool.inputSchema.properties.bearer_token.type, "string");
+});
+
+test("a subscriptions table from before webhook_auth still delivers hmac", async () => {
+  const { db, env } = sqliteEnv();
+  const sub = unwrap(
+    await mcp(env, "create_subscription", {
+      mode: "webhook",
+      url: "https://example.com/hmac",
+      event_types: ["*"],
+    }),
+  );
+  db.exec("ALTER TABLE subscriptions DROP COLUMN webhook_auth");
+  const ev = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:legacy-auth:2026-09-30T00:00:00.000Z",
+    }),
+  );
+  const delivery = db.prepare("SELECT id FROM deliveries WHERE event_id = ? AND subscription_id = ?").get(ev.id, sub.id);
+  let headers;
+  let body;
+  const decision = await consumeDelivery({ body: { delivery_id: delivery.id } }, env, {
+    nowMs: NOW,
+    fetch: async (_url, init) => {
+      headers = init.headers;
+      body = init.body;
+      return new Response("ok", { status: 200 });
+    },
+  });
+  assert.equal(decision.action, "ack");
+  assert.equal(headers.authorization, undefined);
+  assert.equal(
+    await verifyWebhookRequest({
+      secret: sub.secret,
+      timestamp: headers["x-abot-timestamp"],
+      body,
+      signature: headers["x-abot-signature"],
+      nowMs: NOW,
+    }),
+    true,
+  );
+  const view = unwrap(await mcp(env, "get_subscription", { id: sub.id }));
+  assert.equal(view.webhook_auth, "hmac");
+  assert.equal(view.has_secret, true);
+  assert.equal(JSON.stringify(view).includes(sub.secret), false);
+  const poll = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }));
+  assert.equal(unwrap(await mcp(env, "get_subscription", { id: poll.id })).webhook_auth, "hmac");
 });
