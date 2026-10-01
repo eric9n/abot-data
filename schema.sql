@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   url TEXT,
   event_types TEXT NOT NULL DEFAULT '["watchdog.*","calendar.*"]',
   secret_sealed TEXT,
+  webhook_auth TEXT NOT NULL DEFAULT 'hmac',
   watch_heartbeat INTEGER NOT NULL DEFAULT 1,
   agent_id TEXT NOT NULL DEFAULT 'bot:main',
   created_at TEXT NOT NULL,
