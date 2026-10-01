@@ -1,21 +1,23 @@
-# Placeholder config for the abot-data Worker.
+# abot-data Worker.
 #
-# `name` is intentionally `abot-data-unconfigured`, same style as
-# `botu-secrets-unconfigured`. A plain `wrangler deploy` publishes that
-# placeholder Worker only. It does not publish production (data.abot.run).
-# There is no production route in this file.
+# A plain `wrangler deploy` is not allowed to publish production. This file
+# has no production route. The real D1 database_id, the cron trigger, and the
+# queue consumers are injected by the deployer. See deploy/ENV.md.
 #
-# Production deploys are done by the deployer, who injects the real Worker
-# name, the real D1 database_id, routes, and secrets. This repository does
-# not contain secrets.
+# Production secrets are injected by the deployer and must never enter this
+# repository: DATA_MCP_TOKEN, SUBSCRIPTION_SEAL.
 
-name = "abot-data-unconfigured"
+name = "abot-data"
 main = "src/worker.js"
 compatibility_date = "2026-09-01"
 
-# Binding name is fixed as DB. database_name and database_id below are
-# placeholders. The deployer replaces database_id with the real D1 id.
+# Binding name is DB. database_id is a placeholder; the deployer injects the real id.
 [[d1_databases]]
 binding = "DB"
-database_name = "abot-data-unconfigured"
+database_name = "abot-data"
 database_id = "00000000-0000-0000-0000-000000000000"
+
+# Queue producer only. Consumers are part of the deploy contract, not this file.
+[[queues.producers]]
+binding = "DELIVER_QUEUE"
+queue = "abot-deliver"
