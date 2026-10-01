@@ -154,3 +154,23 @@ CREATE INDEX IF NOT EXISTS idx_verification_requests_email
   ON verification_requests(email, requested_at);
 CREATE INDEX IF NOT EXISTS idx_verification_requests_ip
   ON verification_requests(ip, requested_at);
+
+-- OAuth 2.0 authorization-code clients. client_secret_hash is SHA-256 hex.
+-- redirect_uris is a JSON array of exact callback URLs.
+CREATE TABLE IF NOT EXISTS oauth_clients (
+  client_id TEXT PRIMARY KEY,
+  client_secret_hash TEXT NOT NULL,
+  redirect_uris TEXT NOT NULL,
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- One-time authorization codes. code_hash is SHA-256 hex of the 32-byte code.
+CREATE TABLE IF NOT EXISTS oauth_codes (
+  code_hash TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  redirect_uri TEXT NOT NULL,
+  email TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used_at TEXT
+);
