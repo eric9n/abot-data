@@ -12,10 +12,12 @@ CREATE TABLE IF NOT EXISTS contacts (
   source TEXT NOT NULL DEFAULT 'manual',
   created_by TEXT NOT NULL DEFAULT 'human',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  owner_email TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(name);
 CREATE INDEX IF NOT EXISTS idx_contacts_updated ON contacts(updated_at);
+CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts(owner_email);
 
 CREATE TABLE IF NOT EXISTS calendar_events (
   id TEXT PRIMARY KEY,
@@ -34,10 +36,12 @@ CREATE TABLE IF NOT EXISTS calendar_events (
   google_event_id TEXT,
   created_by TEXT NOT NULL DEFAULT 'human',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  owner_email TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_start ON calendar_events(start_utc);
 CREATE INDEX IF NOT EXISTS idx_events_status ON calendar_events(status);
+CREATE INDEX IF NOT EXISTS idx_calendar_events_owner ON calendar_events(owner_email);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_google ON calendar_events(google_event_id)
   WHERE google_event_id IS NOT NULL;
 
@@ -50,9 +54,11 @@ CREATE TABLE IF NOT EXISTS notes (
   source TEXT NOT NULL DEFAULT 'manual',
   created_by TEXT NOT NULL DEFAULT 'human',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  owner_email TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at);
+CREATE INDEX IF NOT EXISTS idx_notes_owner ON notes(owner_email);
 
 -- Phase 2 bus. Append-only. Does not ALTER Phase 1 tables.
 CREATE TABLE IF NOT EXISTS events (
@@ -118,3 +124,33 @@ CREATE TABLE IF NOT EXISTS heartbeats (
   ttl_seconds INTEGER NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- Agent accounts. One email, one account. Codes and tokens are stored as
+-- SHA-256 hex. owner_email above is nullable so existing rows stay NULL.
+CREATE TABLE IF NOT EXISTS accounts (
+  email TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  verified_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_token_hash ON accounts(token_hash);
+
+CREATE TABLE IF NOT EXISTS verification_codes (
+  email TEXT PRIMARY KEY,
+  code_hash TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  requested_at TEXT NOT NULL
+);
+
+-- Sliding window for verification requests: 3 per email and 10 per IP in 60 minutes.
+CREATE TABLE IF NOT EXISTS verification_requests (
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL,
+  ip TEXT NOT NULL,
+  requested_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_verification_requests_email
+  ON verification_requests(email, requested_at);
+CREATE INDEX IF NOT EXISTS idx_verification_requests_ip
+  ON verification_requests(ip, requested_at);

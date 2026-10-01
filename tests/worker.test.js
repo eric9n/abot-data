@@ -56,7 +56,8 @@ const PHASE2_TOOL_NAMES = [
   "delete_subscription",
   "rotate_subscription_secret",
 ];
-const TOOL_NAMES = [...PHASE1_TOOL_NAMES, ...PHASE2_TOOL_NAMES];
+const ACCOUNT_TOOL_NAMES = ["request_account_verification", "verify_account"];
+const TOOL_NAMES = [...PHASE1_TOOL_NAMES, ...PHASE2_TOOL_NAMES, ...ACCOUNT_TOOL_NAMES];
 const SEAL = Buffer.alloc(32, 7).toString("base64");
 
 function schemaSql() {
@@ -189,7 +190,9 @@ test("schema.sql applies twice without dropping rows", () => {
     "created_by",
     "created_at",
     "updated_at",
+    "owner_email",
   ]);
+  assert.equal(db.prepare("SELECT owner_email FROM contacts").get().owner_email, null);
 });
 
 test("wrangler config does not publish production and does not name the mail archive", () => {
@@ -222,7 +225,8 @@ test("wrangler config does not publish production and does not name the mail arc
   assert.equal(toml.includes("RESEND"), false);
   assert.equal(src.includes("779058bf"), false);
   assert.equal(src.includes("WEBHOOK_SECRET"), false);
-  assert.equal(src.includes("RESEND_API_KEY"), false);
+  assert.match(src, /env\.RESEND_API_KEY/);
+  assert.equal(src.includes("re_"), false);
   assert.equal(src.includes("ARCHIVE_BUCKET"), false);
   assert.equal(src.includes("INGEST_QUEUE"), false);
   assert.match(src, /env\.DATA_MCP_TOKEN/);
@@ -275,7 +279,7 @@ test("health is public and MCP auth fails before the database", async () => {
   assert.equal(JSON.stringify(await down.json()).includes("db touched"), false);
 });
 
-test("tools/list keeps the fifteen phase 1 tools then the ten phase 2 tools", async () => {
+test("tools/list keeps phase 1, phase 2, then the account tools", async () => {
   const { env } = sqliteEnv();
   assert.deepEqual(
     TOOLS.map((tool) => tool.name),
@@ -1474,7 +1478,8 @@ test("health and create_contact keep their phase 1 shapes", async () => {
     TOOLS.map((tool) => tool.name).slice(0, 15),
     PHASE1_TOOL_NAMES,
   );
-  assert.deepEqual(TOOLS.map((tool) => tool.name).slice(15), PHASE2_TOOL_NAMES);
+  assert.deepEqual(TOOLS.map((tool) => tool.name).slice(15, 25), PHASE2_TOOL_NAMES);
+  assert.deepEqual(TOOLS.map((tool) => tool.name).slice(25), ACCOUNT_TOOL_NAMES);
 });
 
 test("webhook delivery uses bearer authorization or leaves hmac headers unchanged", async () => {

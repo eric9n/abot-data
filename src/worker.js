@@ -1,7 +1,10 @@
 /**
  * abot-data: personal structured data (contacts, calendar, notes).
- * POST /mcp   MCP (Streamable HTTP, JSON-RPC), Bearer DATA_MCP_TOKEN
- * GET /ctc/{id}  GET /cal/{id}  GET /note/{id}   canonical JSON, same token
+ * POST /mcp   MCP (Streamable HTTP, JSON-RPC)
+ *   Bearer DATA_MCP_TOKEN: legacy access to every row
+ *   Bearer ad_…: one agent account, rows scoped by owner_email
+ *   request_account_verification and verify_account: no Bearer
+ * GET /ctc/{id}  GET /cal/{id}  GET /note/{id}   canonical JSON, same tokens
  * GET /health liveness, no personal data
  * scheduled    detector and delivery repair (not a URL)
  * queue        abot-deliver / abot-deliver-dlq (not a URL)
@@ -25,6 +28,15 @@ const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
 const ID_PREFIXES = new Set(["cal_", "ctc_", "note_", "evt_", "sub_", "dlv_"]);
 const REPEAT_FREQ = new Set(["none", "daily", "weekly", "monthly"]);
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+const PUBLIC_ACCOUNT_TOOLS = new Set(["request_account_verification", "verify_account"]);
+const CODE_TTL_MS = 15 * 60 * 1000;
+const RATE_WINDOW_MS = 60 * 60 * 1000;
+const MAX_EMAIL_CODES = 3;
+const MAX_IP_CODES = 10;
+const MAX_CODE_ATTEMPTS = 5;
+const CODE_SPACE = 1_000_000;
+const CODE_REJECTION_LIMIT = Math.floor(0x1_0000_0000 / CODE_SPACE) * CODE_SPACE;
+const ACCOUNT_EMAIL = /^[a-z0-9._%+-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 
 const CONTACT_FIELDS = "id, name, aliases, org, title, email, phone, relation, notes, source, created_by, created_at, updated_at";
 const EVENT_FIELDS =
@@ -51,6 +63,58 @@ export function timingSafeEqual(a, b) {
     diff |= ca ^ cb;
   }
   return diff === 0;
+}
+
+export async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
+  let hex = "";
+  for (const byte of new Uint8Array(digest)) hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
+
+/** Unbiased 6-digit code. Bytes at or above the rejection limit are skipped. */
+export function verificationCodeFromBytes(bytes) {
+  if (!(bytes instanceof Uint8Array)) throw new Error("bad entropy");
+  for (let i = 0; i + 4 <= bytes.length; i += 4) {
+    const n = bytes[i] * 0x1000000 + bytes[i + 1] * 0x10000 + bytes[i + 2] * 0x100 + bytes[i + 3];
+    if (n < CODE_REJECTION_LIMIT) return String(n % CODE_SPACE).padStart(6, "0");
+  }
+  throw new Error("not enough entropy");
+}
+
+export function newVerificationCode() {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    try {
+      return verificationCodeFromBytes(bytes);
+    } catch (err) {
+      if (!err || err.message !== "not enough entropy") throw err;
+    }
+  }
+  throw new Error("code entropy exhausted");
+}
+
+/** ad_ plus 32 lowercase hex chars from the first 16 bytes. */
+export function accountTokenFromBytes(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.length < 16) throw new Error("not enough entropy");
+  let hex = "";
+  for (let i = 0; i < 16; i++) hex += bytes[i].toString(16).padStart(2, "0");
+  return `ad_${hex}`;
+}
+
+export function newAccountToken() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return accountTokenFromBytes(bytes);
+}
+
+export function normalizeAccountEmail(value) {
+  if (typeof value !== "string") return null;
+  const email = value.trim().toLowerCase();
+  if (email.length < 3 || email.length > 254) return null;
+  if (!ACCOUNT_EMAIL.test(email)) return null;
+  return email;
 }
 
 export function likeContains(value) {
@@ -288,8 +352,23 @@ function parseJson(value, fallback) {
 }
 
 function nowIso(deps) {
-  const ms = deps && typeof deps.nowMs === "number" && Number.isFinite(deps.nowMs) ? deps.nowMs : Date.now();
-  return new Date(ms).toISOString();
+  return new Date(nowMsOf(deps)).toISOString();
+}
+
+function nowMsOf(deps) {
+  return deps && typeof deps.nowMs === "number" && Number.isFinite(deps.nowMs) ? deps.nowMs : Date.now();
+}
+
+/** Per-agent token scopes rows. Legacy and unscoped callers see every row. */
+function scopedOwner(deps) {
+  if (!deps || typeof deps.ownerEmail !== "string" || deps.ownerEmail === "") return null;
+  return deps.ownerEmail;
+}
+
+function ownerSql(owner, params) {
+  if (owner == null) return "";
+  params.push(owner);
+  return " AND owner_email = ?";
 }
 
 const RESOURCE_KIND = { ctc_: "ctc", cal_: "cal", note_: "note" };
@@ -416,13 +495,14 @@ async function createContact(args, deps) {
   const notes = takeText(args, "notes", { nullable: true, allowEmpty: true, max: 20000 });
   const createdBy = takeCreatedBy(args);
   const now = nowIso(deps);
+  const owner = scopedOwner(deps);
   const id = await insertWithId(
     deps,
     "ctc_",
     `INSERT INTO contacts (
-      id, name, aliases, org, title, email, phone, relation, notes, source, created_by, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?)`,
-    [name, aliases, org ?? null, title ?? null, email ?? null, phone ?? null, relation ?? null, notes ?? null, createdBy, now, now],
+      id, name, aliases, org, title, email, phone, relation, notes, source, created_by, created_at, updated_at, owner_email
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?)`,
+    [name, aliases, org ?? null, title ?? null, email ?? null, phone ?? null, relation ?? null, notes ?? null, createdBy, now, now, owner],
   );
   return { id, url: canonicalUrl(deps && deps.origin, id) };
 }
@@ -431,7 +511,12 @@ async function getContact(args, deps) {
   requireArgs(args);
   assertOnlyKeys(args, new Set(["id"]));
   const id = requireId(args.id, "ctc_");
-  const row = await queryFirst(deps, `SELECT ${CONTACT_FIELDS} FROM contacts WHERE id = ?`, [id]);
+  const params = [id];
+  const row = await queryFirst(
+    deps,
+    `SELECT ${CONTACT_FIELDS} FROM contacts WHERE id = ?${ownerSql(scopedOwner(deps), params)}`,
+    params,
+  );
   if (!row) return { found: false, id };
   return { found: true, ...contactView(row, deps.origin) };
 }
@@ -441,13 +526,19 @@ async function listContacts(args, deps) {
   assertOnlyKeys(args, new Set(["query", "limit"]));
   const limit = clampLimit(args.limit, 20, 100);
   const query = optionalQuery(args.query);
+  const filters = [];
   const params = [];
-  let where = "";
+  const owner = scopedOwner(deps);
+  if (owner != null) {
+    filters.push("owner_email = ?");
+    params.push(owner);
+  }
   if (query != null) {
     const pattern = likeContains(query);
-    where = "WHERE (name LIKE ? ESCAPE '\\' OR aliases LIKE ? ESCAPE '\\' OR IFNULL(org, '') LIKE ? ESCAPE '\\')\n";
+    filters.push("(name LIKE ? ESCAPE '\\' OR aliases LIKE ? ESCAPE '\\' OR IFNULL(org, '') LIKE ? ESCAPE '\\')");
     params.push(pattern, pattern, pattern);
   }
+  const where = filters.length ? `WHERE ${filters.join("\n  AND ")}\n` : "";
   params.push(limit);
   const rows = await queryAll(
     deps,
@@ -475,13 +566,16 @@ async function updateContact(args, deps) {
   assign(sets, params, "relation", takeText(args, "relation", { nullable: true, allowEmpty: true, max: 200 }));
   assign(sets, params, "notes", takeText(args, "notes", { nullable: true, allowEmpty: true, max: 20000 }));
   if (sets.length === 0) throw new RpcError(-32602, "no fields to update");
-  const existing = await queryFirst(deps, "SELECT id FROM contacts WHERE id = ?", [id]);
+  const ownerParams = [id];
+  const ownerFilter = ownerSql(scopedOwner(deps), ownerParams);
+  const existing = await queryFirst(deps, `SELECT id FROM contacts WHERE id = ?${ownerFilter}`, ownerParams);
   if (!existing) throw notFound();
   const now = nowIso(deps);
   sets.push("updated_at = ?");
   params.push(now, id);
-  await queryRun(deps, `UPDATE contacts SET ${sets.join(", ")} WHERE id = ?`, params);
-  const row = await queryFirst(deps, `SELECT ${CONTACT_FIELDS} FROM contacts WHERE id = ?`, [id]);
+  if (ownerParams.length > 1) params.push(ownerParams[1]);
+  await queryRun(deps, `UPDATE contacts SET ${sets.join(", ")} WHERE id = ?${ownerFilter}`, params);
+  const row = await queryFirst(deps, `SELECT ${CONTACT_FIELDS} FROM contacts WHERE id = ?${ownerFilter}`, ownerParams);
   return { found: true, ...contactView(row, deps.origin) };
 }
 
@@ -489,9 +583,11 @@ async function deleteContact(args, deps) {
   requireArgs(args);
   assertOnlyKeys(args, new Set(["id"]));
   const id = requireId(args.id, "ctc_");
-  const existing = await queryFirst(deps, "SELECT id FROM contacts WHERE id = ?", [id]);
+  const params = [id];
+  const filter = ownerSql(scopedOwner(deps), params);
+  const existing = await queryFirst(deps, `SELECT id FROM contacts WHERE id = ?${filter}`, params);
   if (!existing) throw notFound();
-  await queryRun(deps, "DELETE FROM contacts WHERE id = ?", [id]);
+  await queryRun(deps, `DELETE FROM contacts WHERE id = ?${filter}`, params);
   return { id, deleted: true };
 }
 
@@ -526,14 +622,15 @@ async function createEvent(args, deps) {
   const notes = takeText(args, "notes", { nullable: true, allowEmpty: true, max: 20000 });
   const createdBy = takeCreatedBy(args);
   const now = nowIso(deps);
+  const owner = scopedOwner(deps);
   const id = await insertWithId(
     deps,
     "cal_",
     `INSERT INTO calendar_events (
       id, title, start_utc, end_utc, timezone, all_day, repeat, source,
-      attendee_ids, reminder_minutes, location, notes, status, created_by, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'bot', ?, ?, ?, ?, 'confirmed', ?, ?, ?)`,
-    [title, start, end, timezone, allDay, repeat, attendees, reminders, location ?? null, notes ?? null, createdBy, now, now],
+      attendee_ids, reminder_minutes, location, notes, status, created_by, created_at, updated_at, owner_email
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'bot', ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?)`,
+    [title, start, end, timezone, allDay, repeat, attendees, reminders, location ?? null, notes ?? null, createdBy, now, now, owner],
   );
   return { id, url: canonicalUrl(deps && deps.origin, id) };
 }
@@ -542,7 +639,12 @@ async function getEvent(args, deps) {
   requireArgs(args);
   assertOnlyKeys(args, new Set(["id"]));
   const id = requireId(args.id, "cal_");
-  const row = await queryFirst(deps, `SELECT ${EVENT_FIELDS} FROM calendar_events WHERE id = ?`, [id]);
+  const params = [id];
+  const row = await queryFirst(
+    deps,
+    `SELECT ${EVENT_FIELDS} FROM calendar_events WHERE id = ?${ownerSql(scopedOwner(deps), params)}`,
+    params,
+  );
   if (!row) return { found: false, id };
   return { found: true, ...eventView(row, deps.origin) };
 }
@@ -560,6 +662,11 @@ async function listEvents(args, deps) {
   if (status) {
     where.push("status = ?");
     params.push(status);
+  }
+  const owner = scopedOwner(deps);
+  if (owner != null) {
+    where.push("owner_email = ?");
+    params.push(owner);
   }
   params.push(limit);
   const rows = await queryAll(
@@ -620,14 +727,16 @@ async function updateEvent(args, deps) {
   assign(sets, params, "notes", notes);
   assign(sets, params, "status", status);
   if (sets.length === 0) throw new RpcError(-32602, "no fields to update");
-  const existing = await queryFirst(deps, `SELECT ${EVENT_FIELDS} FROM calendar_events WHERE id = ?`, [id]);
+  const ownerParams = [id];
+  const filter = ownerSql(scopedOwner(deps), ownerParams);
+  const existing = await queryFirst(deps, `SELECT ${EVENT_FIELDS} FROM calendar_events WHERE id = ?${filter}`, ownerParams);
   if (!existing) throw notFound();
   assertTimeOrder(start ?? existing.start_utc, end ?? existing.end_utc);
   const now = nowIso(deps);
   sets.push("updated_at = ?");
-  params.push(now, id);
-  await queryRun(deps, `UPDATE calendar_events SET ${sets.join(", ")} WHERE id = ?`, params);
-  const row = await queryFirst(deps, `SELECT ${EVENT_FIELDS} FROM calendar_events WHERE id = ?`, [id]);
+  params.push(now, ...ownerParams);
+  await queryRun(deps, `UPDATE calendar_events SET ${sets.join(", ")} WHERE id = ?${filter}`, params);
+  const row = await queryFirst(deps, `SELECT ${EVENT_FIELDS} FROM calendar_events WHERE id = ?${filter}`, ownerParams);
   return { found: true, ...eventView(row, deps.origin) };
 }
 
@@ -635,10 +744,12 @@ async function deleteEvent(args, deps) {
   requireArgs(args);
   assertOnlyKeys(args, new Set(["id"]));
   const id = requireId(args.id, "cal_");
-  const existing = await queryFirst(deps, "SELECT id FROM calendar_events WHERE id = ?", [id]);
+  const params = [id];
+  const filter = ownerSql(scopedOwner(deps), params);
+  const existing = await queryFirst(deps, `SELECT id FROM calendar_events WHERE id = ?${filter}`, params);
   if (!existing) throw notFound();
   const now = nowIso(deps);
-  await queryRun(deps, "UPDATE calendar_events SET status = 'cancelled', updated_at = ? WHERE id = ?", [now, id]);
+  await queryRun(deps, `UPDATE calendar_events SET status = 'cancelled', updated_at = ? WHERE id = ?${filter}`, [now, ...params]);
   return { id, status: "cancelled" };
 }
 
@@ -651,13 +762,14 @@ async function createNote(args, deps) {
   const links = takeStringArray(args, "links", 500) ?? "[]";
   const createdBy = takeCreatedBy(args);
   const now = nowIso(deps);
+  const owner = scopedOwner(deps);
   const id = await insertWithId(
     deps,
     "note_",
     `INSERT INTO notes (
-      id, title, body, tags, links, source, created_by, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?)`,
-    [title, body, tags, links, createdBy, now, now],
+      id, title, body, tags, links, source, created_by, created_at, updated_at, owner_email
+    ) VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?)`,
+    [title, body, tags, links, createdBy, now, now, owner],
   );
   return { id, url: canonicalUrl(deps && deps.origin, id) };
 }
@@ -666,7 +778,12 @@ async function getNote(args, deps) {
   requireArgs(args);
   assertOnlyKeys(args, new Set(["id"]));
   const id = requireId(args.id, "note_");
-  const row = await queryFirst(deps, `SELECT ${NOTE_FIELDS} FROM notes WHERE id = ?`, [id]);
+  const params = [id];
+  const row = await queryFirst(
+    deps,
+    `SELECT ${NOTE_FIELDS} FROM notes WHERE id = ?${ownerSql(scopedOwner(deps), params)}`,
+    params,
+  );
   if (!row) return { found: false, id };
   return { found: true, ...noteView(row, deps.origin) };
 }
@@ -679,6 +796,11 @@ async function listNotes(args, deps) {
   const tag = optionalTag(args.tag);
   const where = [];
   const params = [];
+  const owner = scopedOwner(deps);
+  if (owner != null) {
+    where.push("owner_email = ?");
+    params.push(owner);
+  }
   if (query != null) {
     const pattern = likeContains(query);
     where.push("(title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')");
@@ -712,13 +834,15 @@ async function updateNote(args, deps) {
   assign(sets, params, "tags", takeStringArray(args, "tags", 100));
   assign(sets, params, "links", takeStringArray(args, "links", 500));
   if (sets.length === 0) throw new RpcError(-32602, "no fields to update");
-  const existing = await queryFirst(deps, "SELECT id FROM notes WHERE id = ?", [id]);
+  const ownerParams = [id];
+  const filter = ownerSql(scopedOwner(deps), ownerParams);
+  const existing = await queryFirst(deps, `SELECT id FROM notes WHERE id = ?${filter}`, ownerParams);
   if (!existing) throw notFound();
   const now = nowIso(deps);
   sets.push("updated_at = ?");
-  params.push(now, id);
-  await queryRun(deps, `UPDATE notes SET ${sets.join(", ")} WHERE id = ?`, params);
-  const row = await queryFirst(deps, `SELECT ${NOTE_FIELDS} FROM notes WHERE id = ?`, [id]);
+  params.push(now, ...ownerParams);
+  await queryRun(deps, `UPDATE notes SET ${sets.join(", ")} WHERE id = ?${filter}`, params);
+  const row = await queryFirst(deps, `SELECT ${NOTE_FIELDS} FROM notes WHERE id = ?${filter}`, ownerParams);
   return { found: true, ...noteView(row, deps.origin) };
 }
 
@@ -726,10 +850,196 @@ async function deleteNote(args, deps) {
   requireArgs(args);
   assertOnlyKeys(args, new Set(["id"]));
   const id = requireId(args.id, "note_");
-  const existing = await queryFirst(deps, "SELECT id FROM notes WHERE id = ?", [id]);
+  const params = [id];
+  const filter = ownerSql(scopedOwner(deps), params);
+  const existing = await queryFirst(deps, `SELECT id FROM notes WHERE id = ?${filter}`, params);
   if (!existing) throw notFound();
-  await queryRun(deps, "DELETE FROM notes WHERE id = ?", [id]);
+  await queryRun(deps, `DELETE FROM notes WHERE id = ?${filter}`, params);
   return { id, deleted: true };
+}
+
+function countValue(row) {
+  const n = row && row.n;
+  const value = typeof n === "number" ? n : Number(n);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function rateLimitIp(deps) {
+  const ip = deps && typeof deps.clientIp === "string" ? deps.clientIp.trim() : "";
+  if (!ip) return "unknown";
+  return ip.slice(0, 128);
+}
+
+function randomRequestId() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let hex = "";
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
+
+function requireAccountEmail(args) {
+  if (!has(args, "email")) throw new RpcError(-32602, "email is required");
+  const email = normalizeAccountEmail(args.email);
+  if (!email) throw new RpcError(-32602, "email is invalid");
+  return email;
+}
+
+async function assertVerificationRate(deps, email, ip, nowMs) {
+  const since = new Date(nowMs - RATE_WINDOW_MS).toISOString();
+  await queryRun(deps, "DELETE FROM verification_requests WHERE requested_at <= ?", [since]);
+  const emailRow = await queryFirst(
+    deps,
+    "SELECT COUNT(*) AS n FROM verification_requests WHERE email = ? AND requested_at > ?",
+    [email, since],
+  );
+  const ipRow = await queryFirst(
+    deps,
+    "SELECT COUNT(*) AS n FROM verification_requests WHERE ip = ? AND requested_at > ?",
+    [ip, since],
+  );
+  if (countValue(emailRow) >= MAX_EMAIL_CODES || countValue(ipRow) >= MAX_IP_CODES) {
+    throw new RpcError(-32602, "too many verification requests");
+  }
+}
+
+async function rollbackVerification(deps, email, previous, requestId) {
+  try {
+    if (previous) {
+      await queryRun(
+        deps,
+        `UPDATE verification_codes
+         SET code_hash = ?, expires_at = ?, attempts = ?, requested_at = ?
+         WHERE email = ?`,
+        [previous.code_hash, previous.expires_at, previous.attempts, previous.requested_at, email],
+      );
+    } else {
+      await queryRun(deps, "DELETE FROM verification_codes WHERE email = ?", [email]);
+    }
+    await queryRun(deps, "DELETE FROM verification_requests WHERE id = ?", [requestId]);
+  } catch {
+    // The caller still returns a generic send failure.
+  }
+}
+
+async function sendVerificationEmail(deps, email, code) {
+  const apiKey = deps && deps.env && deps.env.RESEND_API_KEY;
+  if (typeof apiKey !== "string" || apiKey.length === 0) {
+    throw new RpcError(-32603, "could not send verification email");
+  }
+  const doFetch = deps && typeof deps.fetch === "function" ? deps.fetch : fetch;
+  let response;
+  try {
+    response = await doFetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        from: "abot-data@abot.run",
+        to: [email],
+        subject: `abot-data 验证码 ${code}`,
+        text: `你的 abot-data 验证码是 ${code}。验证码 15 分钟内有效。如果不是你本人操作，可以忽略这封邮件。`,
+      }),
+    });
+  } catch {
+    throw new RpcError(-32603, "could not send verification email");
+  }
+  if (!response || response.ok !== true) {
+    throw new RpcError(-32603, "could not send verification email");
+  }
+}
+
+async function requestAccountVerification(args, deps) {
+  requireArgs(args);
+  assertOnlyKeys(args, new Set(["email"]));
+  const email = requireAccountEmail(args);
+  const nowMs = nowMsOf(deps);
+  const ip = rateLimitIp(deps);
+  await assertVerificationRate(deps, email, ip, nowMs);
+  const previous = await queryFirst(
+    deps,
+    "SELECT code_hash, expires_at, attempts, requested_at FROM verification_codes WHERE email = ?",
+    [email],
+  );
+  const code = newVerificationCode();
+  const codeHash = await sha256Hex(code);
+  const requestedAt = new Date(nowMs).toISOString();
+  const expiresAt = new Date(nowMs + CODE_TTL_MS).toISOString();
+  await queryRun(
+    deps,
+    `INSERT INTO verification_codes (email, code_hash, expires_at, attempts, requested_at)
+     VALUES (?, ?, ?, 0, ?)
+     ON CONFLICT(email) DO UPDATE SET
+       code_hash = excluded.code_hash,
+       expires_at = excluded.expires_at,
+       attempts = 0,
+       requested_at = excluded.requested_at`,
+    [email, codeHash, expiresAt, requestedAt],
+  );
+  const requestId = randomRequestId();
+  await queryRun(
+    deps,
+    "INSERT INTO verification_requests (id, email, ip, requested_at) VALUES (?, ?, ?, ?)",
+    [requestId, email, ip, requestedAt],
+  );
+  try {
+    await sendVerificationEmail(deps, email, code);
+  } catch (err) {
+    await rollbackVerification(deps, email, previous, requestId);
+    console.error(JSON.stringify({ msg: "verification email failed" }));
+    if (err instanceof RpcError) throw err;
+    throw new RpcError(-32603, "could not send verification email");
+  }
+  return { ok: true };
+}
+
+async function bumpCodeAttempts(deps, email) {
+  await queryRun(deps, "UPDATE verification_codes SET attempts = attempts + 1 WHERE email = ?", [email]);
+}
+
+async function verifyAccount(args, deps) {
+  requireArgs(args);
+  assertOnlyKeys(args, new Set(["email", "code"]));
+  const email = requireAccountEmail(args);
+  if (!has(args, "code")) throw new RpcError(-32602, "code is required");
+  if (typeof args.code !== "string" || !/^\d{6}$/.test(args.code)) {
+    throw new RpcError(-32602, "code must be a 6-digit string");
+  }
+  const row = await queryFirst(
+    deps,
+    "SELECT code_hash, expires_at, attempts FROM verification_codes WHERE email = ?",
+    [email],
+  );
+  if (!row) throw new RpcError(-32602, "invalid verification code");
+  if (Number(row.attempts) >= MAX_CODE_ATTEMPTS) {
+    await bumpCodeAttempts(deps, email);
+    throw new RpcError(-32602, "too many attempts");
+  }
+  const expiresMs = Date.parse(row.expires_at);
+  if (!Number.isFinite(expiresMs) || nowMsOf(deps) >= expiresMs) {
+    throw new RpcError(-32602, "verification code expired");
+  }
+  const actual = await sha256Hex(args.code);
+  if (typeof row.code_hash !== "string" || !timingSafeEqual(actual, row.code_hash)) {
+    await bumpCodeAttempts(deps, email);
+    throw new RpcError(-32602, "invalid verification code");
+  }
+  const token = newAccountToken();
+  const tokenHash = await sha256Hex(token);
+  const now = nowIso(deps);
+  await queryRun(
+    deps,
+    `INSERT INTO accounts (email, token_hash, created_at, verified_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(email) DO UPDATE SET
+       token_hash = excluded.token_hash,
+       verified_at = excluded.verified_at`,
+    [email, tokenHash, now, now],
+  );
+  await queryRun(deps, "DELETE FROM verification_codes WHERE email = ?", [email]);
+  return { ok: true, token };
 }
 
 const phase2 = createPhase2({
@@ -971,6 +1281,31 @@ export const TOOLS = [
     },
   },
   ...phase2.tools,
+  {
+    name: "request_account_verification",
+    description:
+      "为邮箱申请 agent 账户验证码。无需 Bearer。同一邮箱 60 分钟最多 3 次，同一 IP 60 分钟最多 10 次。验证码 15 分钟有效，通过邮件发送。返回 {ok:true}，不包含验证码。已注册邮箱可以再次申请以轮换 token。",
+    inputSchema: {
+      type: "object",
+      properties: { email: { type: "string" } },
+      required: ["email"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "verify_account",
+    description:
+      "提交邮箱验证码。成功返回 {ok:true, token}。token 形如 ad_ 加 32 位十六进制，只出现这一次。已有账户会轮换 token，旧 token 立即失效。验证码错误会计入尝试次数，达到 5 次后拒绝。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email: { type: "string" },
+        code: { type: "string" },
+      },
+      required: ["email", "code"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 function toolText(value) {
@@ -978,6 +1313,9 @@ function toolText(value) {
 }
 
 async function callTool(name, args, deps) {
+  if (deps && deps.authKind === "public" && !PUBLIC_ACCOUNT_TOOLS.has(name)) {
+    throw new RpcError(-32601, `unknown tool: ${name}`);
+  }
   switch (name) {
     case "create_contact":
       return createContact(args, deps);
@@ -1009,6 +1347,10 @@ async function callTool(name, args, deps) {
       return updateNote(args, deps);
     case "delete_note":
       return deleteNote(args, deps);
+    case "request_account_verification":
+      return requestAccountVerification(args, deps);
+    case "verify_account":
+      return verifyAccount(args, deps);
     default: {
       const handler = phase2.handlers[name];
       if (handler) return handler(args, deps);
@@ -1118,11 +1460,87 @@ function pathOf(request) {
   return url.pathname;
 }
 
-function bearerOk(header, token) {
-  if (typeof header !== "string" || typeof token !== "string" || token.length === 0) return false;
+function bearerToken(header) {
+  if (typeof header !== "string") return null;
   const match = /^Bearer (.+)$/i.exec(header);
-  if (!match) return false;
-  return timingSafeEqual(match[1], token);
+  return match ? match[1] : null;
+}
+
+function bearerOk(header, token) {
+  if (typeof token !== "string" || token.length === 0) return false;
+  const presented = bearerToken(header);
+  if (presented == null) return false;
+  return timingSafeEqual(presented, token);
+}
+
+function clientIp(request, deps) {
+  if (deps && typeof deps.clientIp === "string" && deps.clientIp.trim() !== "") {
+    return deps.clientIp.trim().slice(0, 128);
+  }
+  const cf = request.headers.get("cf-connecting-ip");
+  if (cf && cf.trim()) return cf.trim().slice(0, 128);
+  const forwarded = request.headers.get("x-forwarded-for");
+  if (forwarded) {
+    const first = forwarded.split(",")[0].trim();
+    if (first) return first.slice(0, 128);
+  }
+  return "unknown";
+}
+
+function isPublicAccountCall(message) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+  if (message.method !== "tools/call") return false;
+  const params = message.params;
+  if (!params || typeof params !== "object" || Array.isArray(params)) return false;
+  return PUBLIC_ACCOUNT_TOOLS.has(params.name);
+}
+
+async function readPublicAccountCall(request) {
+  if (!jsonContentType(request.headers.get("content-type"))) return null;
+  const declared = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return null;
+  const raw = await request.arrayBuffer();
+  if (raw.byteLength > MAX_BODY_BYTES) return null;
+  try {
+    const message = JSON.parse(new TextDecoder("utf-8").decode(raw));
+    if (!isPublicAccountCall(message)) return null;
+    return message;
+  } catch {
+    return null;
+  }
+}
+
+async function accountEmailForToken(env, token) {
+  const hash = await sha256Hex(token);
+  const row = await d1Deps(env).queryFirst("SELECT email FROM accounts WHERE token_hash = ?", [hash]);
+  return row && typeof row.email === "string" ? row.email : null;
+}
+
+async function resolveBearer(request, env) {
+  const header = request.headers.get("authorization");
+  if (bearerOk(header, env && env.DATA_MCP_TOKEN)) return { kind: "legacy" };
+  const presented = bearerToken(header);
+  if (typeof presented === "string" && presented.startsWith("ad_")) {
+    try {
+      const email = await accountEmailForToken(env, presented);
+      if (!email) return { kind: "unauthorized" };
+      return { kind: "account", email };
+    } catch {
+      console.error(JSON.stringify({ msg: "account auth failed" }));
+      return { kind: "error" };
+    }
+  }
+  if (header == null || String(header).trim() === "") return { kind: "anonymous" };
+  return { kind: "unauthorized" };
+}
+
+function attachIdentity(runtime, env, request, deps, identity) {
+  runtime.env = env;
+  runtime.authKind = identity.kind;
+  runtime.ownerEmail = identity.kind === "account" ? identity.email : null;
+  runtime.clientIp = clientIp(request, deps);
+  if (deps && typeof deps.fetch === "function") runtime.fetch = deps.fetch;
+  return runtime;
 }
 
 function jsonContentType(header) {
@@ -1171,26 +1589,34 @@ export async function handleFetch(request, env, deps = {}) {
 
   if (path === "/mcp") {
     if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
-    if (!bearerOk(request.headers.get("authorization"), env && env.DATA_MCP_TOKEN)) {
-      return json({ ok: false, error: "unauthorized" }, 401);
+    let identity = await resolveBearer(request, env);
+    if (identity.kind === "error") return json({ ok: false }, 500);
+    if (identity.kind === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
+    let message = null;
+    if (identity.kind === "anonymous") {
+      message = await readPublicAccountCall(request);
+      if (!message) return json({ ok: false, error: "unauthorized" }, 401);
+      identity = { kind: "public" };
     }
-    if (!jsonContentType(request.headers.get("content-type"))) {
-      return json(
-        { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Content-Type must be application/json" } },
-        415,
-      );
+    if (!message) {
+      if (!jsonContentType(request.headers.get("content-type"))) {
+        return json(
+          { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Content-Type must be application/json" } },
+          415,
+        );
+      }
+      const raw = await request.arrayBuffer();
+      if (raw.byteLength > MAX_BODY_BYTES) {
+        return json({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "payload too large" } }, 413);
+      }
+      try {
+        message = JSON.parse(new TextDecoder("utf-8").decode(raw));
+      } catch {
+        return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
+      }
     }
-    const raw = await request.arrayBuffer();
-    if (raw.byteLength > MAX_BODY_BYTES) {
-      return json({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "payload too large" } }, 413);
-    }
-    let message;
-    try {
-      message = JSON.parse(new TextDecoder("utf-8").decode(raw));
-    } catch {
-      return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
-    }
-    const rpc = await handleMcpRpc(message, phase2.bindRuntime(env, { nowMs: deps.nowMs, origin }));
+    const runtime = attachIdentity(phase2.bindRuntime(env, { nowMs: deps.nowMs, origin }), env, request, deps, identity);
+    const rpc = await handleMcpRpc(message, runtime);
     if (rpc.type === "notification") return new Response(null, { status: 202 });
     if (rpc.type === "error") {
       return json({ jsonrpc: "2.0", id: rpc.id ?? null, error: rpc.error });
@@ -1201,7 +1627,9 @@ export async function handleFetch(request, env, deps = {}) {
   const resource = resourceFromPath(path);
   if (resource) {
     if (request.method !== "GET") return json({ ok: false, error: "method not allowed" }, 405);
-    if (!bearerOk(request.headers.get("authorization"), env && env.DATA_MCP_TOKEN)) {
+    const identity = await resolveBearer(request, env);
+    if (identity.kind === "error") return json({ ok: false }, 500);
+    if (identity.kind !== "legacy" && identity.kind !== "account") {
       return json({ ok: false, error: "unauthorized" }, 401);
     }
     const spec = RESOURCE_READ[resource.kind];
@@ -1209,7 +1637,13 @@ export async function handleFetch(request, env, deps = {}) {
       return json({ found: false, id: resource.id }, 404);
     }
     try {
-      const row = await d1Deps(env).queryFirst(spec.sql, [resource.id]);
+      const params = [resource.id];
+      let sql = spec.sql;
+      if (identity.kind === "account") {
+        sql += " AND owner_email = ?";
+        params.push(identity.email);
+      }
+      const row = await d1Deps(env).queryFirst(sql, params);
       if (!row) return json({ found: false, id: resource.id }, 404);
       return json({ found: true, ...spec.view(row, origin) });
     } catch (err) {
