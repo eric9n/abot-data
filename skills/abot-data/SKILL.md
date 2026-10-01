@@ -11,7 +11,7 @@ description: "操作 bot 的个人结构化数据层。用户问起 contacts、c
 
 ## Purpose
 
-abot-data 是 bot 的个人结构化数据层。MCP 只暴露数据。同步和通知由外部组件做，不要在这个服务里实现同步、发信或部署。
+abot-data 是 bot 的个人结构化数据层。MCP 只暴露数据。同步和部署由外部组件做，不要在这个服务里实现。账户验证码是例外：服务会通过 Resend 把 6 位验证码发到注册邮箱。
 
 日历、通讯录和笔记是 bot 自己的记录。事件总线用 `audience` 区分 bot 与 user。
 
@@ -19,16 +19,23 @@ abot-data 是 bot 的个人结构化数据层。MCP 只暴露数据。同步和�
 
 ## Connection
 
-`POST {server}/mcp`。传输是 Streamable HTTP，body 是 JSON-RPC 2.0。鉴权是 Bearer，token 由部署方提供，不要写入仓库、日志或这个 skill。
+`POST {server}/mcp`。传输是 Streamable HTTP，body 是 JSON-RPC 2.0。
+
+有两种 Bearer：
+
+- 部署方提供的 `DATA_MCP_TOKEN`：legacy 全量访问，行为与以前相同。
+- `verify_account` 返回的 `ad_` token：只属于一个邮箱。联系人、日历、笔记按 `owner_email` 隔离。事件总线（events、subscriptions、deliveries、heartbeats）不隔离。
+
+`request_account_verification` 和 `verify_account` 不需要 Bearer。不要把返回的 `ad_` token 写入仓库、日志或这个 skill。
 
 生产地址例如 `https://data.abot.run/mcp`。`GET /health` 公开，不需要 token。正常响应是 `{ "ok": true, "service": "abot-data" }`，例如 `https://data.abot.run/health`。
 
 ```http
-Authorization: Bearer <部署方提供的 token>
+Authorization: Bearer <部署方提供的 token，或 ad_ token>
 Content-Type: application/json
 ```
 
-token 缺失或错误时，服务在读 body 之前返回 HTTP 401：`{ "ok": false, "error": "unauthorized" }`。
+除上述两个账户工具外，token 缺失或错误时返回 HTTP 401：`{ "ok": false, "error": "unauthorized" }`。带了错误 Bearer 时，即使调用的是账户工具也是 401。
 
 ```json
 {
@@ -50,7 +57,7 @@ token 缺失或错误时，服务在读 body 之前返回 HTTP 401：`{ "ok": fa
 
 ## 工具总览
 
-共 25 个工具。多传 schema 里没有的字段会得到 `-32602`。
+共 27 个工具。多传 schema 里没有的字段会得到 `-32602`。
 
 ### contacts
 
@@ -98,6 +105,15 @@ token 缺失或错误时，服务在读 body 之前返回 HTTP 401：`{ "ok": fa
 ### deliveries
 
 没有 MCP 工具。每次 webhook 推送记在 `deliveries` 表：`state`、`attempts`、`next_attempt_at`、`last_error`、`dead_reason`。状态见下面的投递语义。
+
+### accounts
+
+一个邮箱一个账户。不需要事先有 Bearer。
+
+- `request_account_verification`：向邮箱发送 6 位验证码。同一邮箱 60 分钟最多 3 次，同一 IP 60 分钟最多 10 次。15 分钟有效。返回 `{ok:true}`，响应里没有验证码。已注册邮箱可以再申请，用来轮换 token。
+- `verify_account`：提交邮箱和验证码。成功返回 `{ok:true, token}`。token 形如 `ad_` 加 32 位十六进制，只出现这一次。错误验证码最多尝试 5 次。
+
+用 `ad_` token 调用时，`create_*` 把 `owner_email` 写成这个邮箱；`get_*`、`list_*`、`update_*`、`delete_*` 只作用于自己的行。看不到别人的行，也看不到 legacy 的 NULL 行。`created_by` 仍然只能是 `human` 或 `bot:main`。
 
 ### heartbeats
 
@@ -199,6 +215,7 @@ hmac 订阅轮换时不要传 `bearer_token`。服务端会生成新 secret，�
 - `audience` 默认 `bot`。只有与用户相关的事件才标 `user`。
 - poll 之后用当次 `lease_token` 调用 `ack_event`。`cursor` 不是完成标记。
 - HMAC 的 `secret` 只出现一次。转达给调用方之后不要写入文件、日志或仓库。
+- `verify_account` 的 `token` 也只出现一次。不要写入文件、日志或仓库，也不要在其他工具参数里回传。
 - webhook 的 Bearer token 由订阅方提供，响应里没有它。不要把它和 MCP 的接入 token 混用，也不要写进仓库或日志。
 - `payload` 里不要放密钥、口令或签名材料。
 - 不要 `emit_event` 写 `watchdog.*` 或 `calendar.due`。

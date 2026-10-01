@@ -194,6 +194,22 @@
 
 没有工具。投递状态在 `deliveries` 表，不通过 MCP 查询。
 
+## accounts
+
+公开工具，不需要 Bearer。已注册邮箱可以再次验证以轮换 token。
+
+### request_account_verification
+
+为邮箱申请 agent 账户验证码。无需 Bearer。同一邮箱 60 分钟最多 3 次，同一 IP 60 分钟最多 10 次。验证码 15 分钟有效，通过邮件发送。返回 {ok:true}，不包含验证码。已注册邮箱可以再次申请以轮换 token。
+
+必填：`email`
+
+### verify_account
+
+提交邮箱验证码。成功返回 {ok:true, token}。token 形如 ad_ 加 32 位十六进制，只出现这一次。已有账户会轮换 token，旧 token 立即失效。验证码错误会计入尝试次数，达到 5 次后拒绝。
+
+必填：`email`、`code`
+
 ## heartbeats
 
 ### heartbeat
