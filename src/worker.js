@@ -6,9 +6,9 @@
  *   request_account_verification and verify_account: no Bearer
  * GET /ctc/{id}  GET /cal/{id}  GET /note/{id}   canonical JSON, same tokens
  * GET /health liveness, no personal data
- * GET  /oauth/authorize   authorization-code consent page (email code)
+ * GET  /oauth/authorize   authorization-code consent page (email code, optional PKCE S256)
  * POST /oauth/authorize   send or verify the email code, then 302
- * POST /oauth/token       exchange a one-time code for the ad_ token
+ * POST /oauth/token       exchange a one-time code for the ad_ token (secret and/or PKCE)
  * scheduled    detector and delivery repair (not a URL)
  * queue        abot-deliver / abot-deliver-dlq (not a URL)
  *
@@ -1678,7 +1678,81 @@ function readOAuthQuery(url) {
   if (scope != null && (scope.length > 512 || /[\u0000-\u001F\u007F]/.test(scope))) {
     throw new RpcError(-32602, "scope is invalid");
   }
-  return { clientId, redirectUri, state, scope: scope || "" };
+  return { clientId, redirectUri, state, scope: scope || "", ...readPkceParams(url) };
+}
+
+function blankToNull(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return value;
+}
+
+/** S256 challenge is 32 bytes of SHA-256, base64url, no padding: 43 chars. */
+const PKCE_CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
+const PKCE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
+
+function readPkceParams(url) {
+  const challenge = blankToNull(url.searchParams.get("code_challenge"));
+  const method = blankToNull(url.searchParams.get("code_challenge_method"));
+  if (challenge == null && method == null) return { codeChallenge: null };
+  if (method !== "S256") throw new RpcError(-32602, "code_challenge_method must be S256");
+  if (challenge == null) throw new RpcError(-32602, "code_challenge is required");
+  if (!PKCE_CHALLENGE.test(challenge)) throw new RpcError(-32602, "code_challenge is invalid");
+  return { codeChallenge: challenge };
+}
+
+function clientHasSecret(row) {
+  return typeof row.client_secret_hash === "string" && row.client_secret_hash.length > 0;
+}
+
+/** base64url without padding. S256(verifier) is this encoding of SHA-256(verifier). */
+function bytesToBase64Url(bytes) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let out = "";
+  let i = 0;
+  for (; i + 3 <= bytes.length; i += 3) {
+    const n = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+    out += alphabet[(n >> 18) & 63];
+    out += alphabet[(n >> 12) & 63];
+    out += alphabet[(n >> 6) & 63];
+    out += alphabet[n & 63];
+  }
+  const left = bytes.length - i;
+  if (left === 1) {
+    const n = bytes[i] << 16;
+    out += alphabet[(n >> 18) & 63] + alphabet[(n >> 12) & 63];
+  } else if (left === 2) {
+    const n = (bytes[i] << 16) | (bytes[i + 1] << 8);
+    out += alphabet[(n >> 18) & 63] + alphabet[(n >> 12) & 63] + alphabet[(n >> 6) & 63];
+  }
+  return out;
+}
+
+async function pkceS256(verifier) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return bytesToBase64Url(new Uint8Array(digest));
+}
+
+async function assertPkceVerifier(challenge, verifier) {
+  if (verifier == null) throw new RpcError(-32602, "code_verifier is required");
+  if (!PKCE_VERIFIER.test(verifier)) throw new RpcError(-32602, "invalid code_verifier");
+  const actual = await pkceS256(verifier);
+  if (!timingSafeEqual(actual, challenge)) throw new RpcError(-32602, "invalid code_verifier");
+}
+
+async function ensureCodeChallengeColumn(deps) {
+  const rows = await queryAll(
+    deps,
+    "SELECT name FROM pragma_table_info('oauth_codes') WHERE name = 'code_challenge'",
+    [],
+  );
+  if (rows.length > 0) return;
+  try {
+    await queryRun(deps, "ALTER TABLE oauth_codes ADD COLUMN code_challenge TEXT", []);
+  } catch (err) {
+    const message = err && err.message ? String(err.message) : String(err);
+    if (/duplicate column/i.test(message)) return;
+    throw err;
+  }
 }
 
 async function loadOAuthClient(deps, clientId) {
@@ -1720,6 +1794,10 @@ function authorizeAction(query) {
   params.set("redirect_uri", query.redirectUri);
   params.set("state", query.state);
   if (query.scope) params.set("scope", query.scope);
+  if (query.codeChallenge) {
+    params.set("code_challenge", query.codeChallenge);
+    params.set("code_challenge_method", "S256");
+  }
   return `/oauth/authorize?${params.toString()}`;
 }
 
@@ -1814,11 +1892,12 @@ async function postOAuthAuthorize(request, query, runtime) {
       const code = newAuthorizationCode();
       const codeHash = await sha256Hex(code);
       const expiresAt = new Date(nowMsOf(runtime) + OAUTH_CODE_TTL_MS).toISOString();
+      await ensureCodeChallengeColumn(runtime);
       await queryRun(
         runtime,
-        `INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, email, expires_at, used_at)
-         VALUES (?, ?, ?, ?, ?, NULL)`,
-        [codeHash, query.clientId, query.redirectUri, normalized, expiresAt],
+        `INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, email, expires_at, used_at, code_challenge)
+         VALUES (?, ?, ?, ?, ?, NULL, ?)`,
+        [codeHash, query.clientId, query.redirectUri, normalized, expiresAt, query.codeChallenge],
       );
       return redirectWithCode(query.redirectUri, query.state, code);
     }
@@ -1842,6 +1921,9 @@ async function handleOAuthAuthorize(request, env, deps) {
     const runtime = oauthRuntime(env, request, deps);
     const client = await loadOAuthClient(runtime, query.clientId);
     assertRegisteredRedirect(client, query.redirectUri);
+    if (!clientHasSecret(client) && !query.codeChallenge) {
+      throw new RpcError(-32602, "code_challenge is required");
+    }
     if (request.method === "GET") return html(renderAuthorizePage(query, {}));
     return postOAuthAuthorize(request, query, runtime);
   } catch (err) {
@@ -1853,6 +1935,12 @@ function requireBodyString(body, key) {
   if (!body || typeof body !== "object" || !has(body, key) || typeof body[key] !== "string" || body[key].length === 0) {
     throw new RpcError(-32602, `${key} is required`);
   }
+  return body[key];
+}
+
+function optionalBodyString(body, key) {
+  if (!body || typeof body !== "object" || !has(body, key) || body[key] == null || body[key] === "") return null;
+  if (typeof body[key] !== "string") throw new RpcError(-32602, `${key} is invalid`);
   return body[key];
 }
 
@@ -1874,7 +1962,7 @@ async function readTokenBody(request) {
   if (media === "application/x-www-form-urlencoded" || media === "") {
     const params = new URLSearchParams(text);
     const out = {};
-    for (const key of ["grant_type", "code", "redirect_uri", "client_id", "client_secret"]) {
+    for (const key of ["grant_type", "code", "redirect_uri", "client_id", "client_secret", "code_verifier"]) {
       const value = params.get(key);
       if (value != null) out[key] = value;
     }
@@ -1894,16 +1982,21 @@ async function handleOAuthToken(request, env, deps) {
     const code = requireBodyString(body, "code");
     const redirectUri = requireBodyString(body, "redirect_uri");
     const clientId = requireBodyString(body, "client_id");
-    const clientSecret = requireBodyString(body, "client_secret");
+    const clientSecret = optionalBodyString(body, "client_secret");
+    const codeVerifier = optionalBodyString(body, "code_verifier");
     if (!/^[0-9a-f]{64}$/.test(code)) throw new RpcError(-32602, "invalid authorization code");
     if (!/^[A-Za-z0-9._:-]{1,128}$/.test(clientId)) throw new RpcError(-32602, "client_id is invalid");
     const runtime = oauthRuntime(env, request, deps);
     const client = await loadOAuthClient(runtime, clientId);
-    await assertClientSecret(client, clientSecret);
+    if (clientHasSecret(client)) {
+      if (clientSecret == null) throw new RpcError(-32602, "client_secret is required");
+      await assertClientSecret(client, clientSecret);
+    }
+    await ensureCodeChallengeColumn(runtime);
     const codeHash = await sha256Hex(code);
     const row = await queryFirst(
       runtime,
-      "SELECT client_id, redirect_uri, email, expires_at, used_at FROM oauth_codes WHERE code_hash = ?",
+      "SELECT client_id, redirect_uri, email, expires_at, used_at, code_challenge FROM oauth_codes WHERE code_hash = ?",
       [codeHash],
     );
     if (!row) throw new RpcError(-32602, "invalid authorization code");
@@ -1915,6 +2008,12 @@ async function handleOAuthToken(request, env, deps) {
     const expiresMs = Date.parse(row.expires_at);
     if (!Number.isFinite(expiresMs) || nowMsOf(runtime) >= expiresMs) {
       throw new RpcError(-32602, "authorization code expired");
+    }
+    const boundChallenge = typeof row.code_challenge === "string" && row.code_challenge.length > 0 ? row.code_challenge : null;
+    if (boundChallenge) {
+      await assertPkceVerifier(boundChallenge, codeVerifier);
+    } else if (!clientHasSecret(client)) {
+      throw new RpcError(-32602, "code_verifier is required");
     }
     const email = normalizeAccountEmail(row.email);
     if (!email) throw new RpcError(-32603, "internal error");

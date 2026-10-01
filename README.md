@@ -12,7 +12,7 @@ Worker 是多模块：主模块 `src/worker.js`，辅助模块 `src/phase2.js`�
 
 - **calendar / contacts / notes**：bot 自己的日历、通讯录和笔记，不是用户个人数据的代理。`DATA_MCP_TOKEN` 仍看全部行。`ad_` 账户 token 只看 `owner_email` 等于自己的行。
 - **accounts**：一个邮箱一个 agent 账户。`request_account_verification` 和 `verify_account` 不需要 Bearer；验证码经 Resend 发出，token 只在验证成功时返回一次。
-- **oauth**：connector 用 authorization code 绑定同一个账户。`GET /oauth/authorize` 渲染邮箱验证页，表单 POST 回同一地址发码、验码，通过后 302 回 `redirect_uri`。`POST /oauth/token` 用 `client_secret` 换 `ad_` token。没有 PKCE。客户端登记在 `oauth_clients`（secret 只存 SHA-256，`redirect_uris` 是精确匹配的 JSON 数组）。授权码 10 分钟、一次性，库里只存 SHA-256。换到的 access token 就是该邮箱的 `ad_` token，再次签发会轮换并使旧 token 失效。
+- **oauth**：connector 用 authorization code 绑定同一个账户。`GET /oauth/authorize` 渲染邮箱验证页，可以额外带 `code_challenge` 和 `code_challenge_method=S256`（只支持 S256；带了 challenge 但 method 不是 S256 会拒绝）。表单 POST 回同一地址发码、验码，通过后 302 回 `redirect_uri`，challenge 记在这条授权码上。`POST /oauth/token` 换 `ad_` token：登记了 secret 的客户端仍要校验 `client_secret`；授权码绑了 challenge 时必须带 `code_verifier`，S256（无填充的 base64url(SHA-256)）不一致就拒绝，并且不消耗授权码。`client_secret_hash` 为空字符串表示公开客户端，不校验 secret，授权时必须带 S256 challenge。不带 challenge 的 secret 流程保持可用。客户端登记在 `oauth_clients`（secret 只存 SHA-256，`redirect_uris` 是精确匹配的 JSON 数组）。授权码 10 分钟、一次性，库里只存 SHA-256。换到的 access token 就是该邮箱的 `ad_` token，再次签发会轮换并使旧 token 失效。
 - **events**：事件总线，用 audience 标签区分 bot 与 user。
 - **subscriptions**：外部订阅，webhook 推送支持 HMAC 与 Bearer 两种鉴权。
 - **heartbeats**：心跳。
