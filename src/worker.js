@@ -6,6 +6,9 @@
  *   request_account_verification and verify_account: no Bearer
  * GET /ctc/{id}  GET /cal/{id}  GET /note/{id}   canonical JSON, same tokens
  * GET /health liveness, no personal data
+ * GET  /oauth/authorize   authorization-code consent page (email code)
+ * POST /oauth/authorize   send or verify the email code, then 302
+ * POST /oauth/token       exchange a one-time code for the ad_ token
  * scheduled    detector and delivery repair (not a URL)
  * queue        abot-deliver / abot-deliver-dlq (not a URL)
  *
@@ -30,6 +33,7 @@ const REPEAT_FREQ = new Set(["none", "daily", "weekly", "monthly"]);
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 const PUBLIC_ACCOUNT_TOOLS = new Set(["request_account_verification", "verify_account"]);
 const CODE_TTL_MS = 15 * 60 * 1000;
+const OAUTH_CODE_TTL_MS = 10 * 60 * 1000;
 const RATE_WINDOW_MS = 60 * 60 * 1000;
 const MAX_EMAIL_CODES = 3;
 const MAX_IP_CODES = 10;
@@ -1001,12 +1005,9 @@ async function bumpCodeAttempts(deps, email) {
   await queryRun(deps, "UPDATE verification_codes SET attempts = attempts + 1 WHERE email = ?", [email]);
 }
 
-async function verifyAccount(args, deps) {
-  requireArgs(args);
-  assertOnlyKeys(args, new Set(["email", "code"]));
-  const email = requireAccountEmail(args);
-  if (!has(args, "code")) throw new RpcError(-32602, "code is required");
-  if (typeof args.code !== "string" || !/^\d{6}$/.test(args.code)) {
+/** Shared by verify_account and the OAuth consent page. Does not issue a token. */
+async function assertVerificationCode(deps, email, code) {
+  if (typeof code !== "string" || !/^\d{6}$/.test(code)) {
     throw new RpcError(-32602, "code must be a 6-digit string");
   }
   const row = await queryFirst(
@@ -1023,11 +1024,14 @@ async function verifyAccount(args, deps) {
   if (!Number.isFinite(expiresMs) || nowMsOf(deps) >= expiresMs) {
     throw new RpcError(-32602, "verification code expired");
   }
-  const actual = await sha256Hex(args.code);
+  const actual = await sha256Hex(code);
   if (typeof row.code_hash !== "string" || !timingSafeEqual(actual, row.code_hash)) {
     await bumpCodeAttempts(deps, email);
     throw new RpcError(-32602, "invalid verification code");
   }
+}
+
+async function issueAccountToken(deps, email) {
   const token = newAccountToken();
   const tokenHash = await sha256Hex(token);
   const now = nowIso(deps);
@@ -1040,6 +1044,16 @@ async function verifyAccount(args, deps) {
        verified_at = excluded.verified_at`,
     [email, tokenHash, now, now],
   );
+  return token;
+}
+
+async function verifyAccount(args, deps) {
+  requireArgs(args);
+  assertOnlyKeys(args, new Set(["email", "code"]));
+  const email = requireAccountEmail(args);
+  if (!has(args, "code")) throw new RpcError(-32602, "code is required");
+  await assertVerificationCode(deps, email, args.code);
+  const token = await issueAccountToken(deps, email);
   await queryRun(deps, "DELETE FROM verification_codes WHERE email = ?", [email]);
   return { ok: true, token };
 }
@@ -1573,6 +1587,350 @@ function isResourceId(id, prefix) {
   return typeof id === "string" && new RegExp(`^${prefix}[a-z0-9]{12}$`).test(id);
 }
 
+function mediaType(header) {
+  if (!header) return "";
+  return header.split(";", 1)[0].trim().toLowerCase();
+}
+
+function changesOf(result) {
+  const changes = result && result.meta ? result.meta.changes : undefined;
+  const value = typeof changes === "number" ? changes : Number(changes);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function oauthRuntime(env, request, deps) {
+  return {
+    ...d1Deps(env),
+    env,
+    nowMs: deps && deps.nowMs,
+    fetch: deps && deps.fetch,
+    clientIp: clientIp(request, deps),
+  };
+}
+
+function oauthFail(err) {
+  if (err instanceof RpcError) {
+    const status = err.code === -32603 ? 500 : 400;
+    return json({ error: { code: err.code, message: err.message } }, status);
+  }
+  console.error(JSON.stringify({ msg: "oauth failed", error: err && err.message }));
+  return json({ error: { code: -32603, message: "internal error" } }, 500);
+}
+
+function html(body, status = 200) {
+  return new Response(body, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+async function readLimitedBody(request) {
+  const declared = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+    throw new RpcError(-32602, "payload too large");
+  }
+  const raw = await request.arrayBuffer();
+  if (raw.byteLength > MAX_BODY_BYTES) throw new RpcError(-32602, "payload too large");
+  return new TextDecoder("utf-8").decode(raw);
+}
+
+function readOAuthQuery(url) {
+  const responseType = url.searchParams.get("response_type");
+  const clientId = url.searchParams.get("client_id");
+  const redirectUri = url.searchParams.get("redirect_uri");
+  const state = url.searchParams.get("state");
+  const scope = url.searchParams.get("scope");
+  if (responseType !== "code") throw new RpcError(-32602, "response_type must be code");
+  if (typeof clientId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(clientId)) {
+    throw new RpcError(-32602, "client_id is invalid");
+  }
+  if (
+    typeof redirectUri !== "string" ||
+    redirectUri.length === 0 ||
+    redirectUri.length > 2048 ||
+    /[\s]/.test(redirectUri)
+  ) {
+    throw new RpcError(-32602, "redirect_uri is invalid");
+  }
+  let parsed;
+  try {
+    parsed = new URL(redirectUri);
+  } catch {
+    throw new RpcError(-32602, "redirect_uri is invalid");
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new RpcError(-32602, "redirect_uri is invalid");
+  }
+  if (typeof state !== "string" || state.length === 0 || state.length > 512 || /[\u0000-\u001F\u007F]/.test(state)) {
+    throw new RpcError(-32602, "state is invalid");
+  }
+  if (scope != null && (scope.length > 512 || /[\u0000-\u001F\u007F]/.test(scope))) {
+    throw new RpcError(-32602, "scope is invalid");
+  }
+  return { clientId, redirectUri, state, scope: scope || "" };
+}
+
+async function loadOAuthClient(deps, clientId) {
+  const row = await queryFirst(
+    deps,
+    "SELECT client_id, client_secret_hash, redirect_uris, name FROM oauth_clients WHERE client_id = ?",
+    [clientId],
+  );
+  if (!row) throw new RpcError(-32602, "unknown client_id");
+  return row;
+}
+
+function assertRegisteredRedirect(row, redirectUri) {
+  let list;
+  try {
+    list = JSON.parse(row.redirect_uris);
+  } catch {
+    list = null;
+  }
+  if (!Array.isArray(list) || !list.some((item) => item === redirectUri)) {
+    throw new RpcError(-32602, "redirect_uri mismatch");
+  }
+}
+
+async function assertClientSecret(row, secret) {
+  if (typeof secret !== "string" || secret.length === 0 || secret.length > 512) {
+    throw new RpcError(-32602, "invalid client_secret");
+  }
+  const actual = await sha256Hex(secret);
+  if (typeof row.client_secret_hash !== "string" || !timingSafeEqual(actual, row.client_secret_hash)) {
+    throw new RpcError(-32602, "invalid client_secret");
+  }
+}
+
+function authorizeAction(query) {
+  const params = new URLSearchParams();
+  params.set("response_type", "code");
+  params.set("client_id", query.clientId);
+  params.set("redirect_uri", query.redirectUri);
+  params.set("state", query.state);
+  if (query.scope) params.set("scope", query.scope);
+  return `/oauth/authorize?${params.toString()}`;
+}
+
+function renderAuthorizePage(query, view) {
+  const email = view.email || "";
+  const error = view.error ? `<p class="error">${escapeHtml(view.error)}</p>` : "";
+  const sent = view.sent ? `<p class="ok">验证码已发送，15 分钟内有效。</p>` : "";
+  return `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>绑定邮箱</title>
+<style>
+  body { font-family: sans-serif; max-width: 24rem; margin: 4rem auto; padding: 0 1rem; }
+  label { display: block; margin-top: 1rem; }
+  input, button { font: inherit; }
+  input { width: 100%; box-sizing: border-box; padding: 0.4rem; margin-top: 0.25rem; }
+  button { margin-top: 0.75rem; margin-right: 0.4rem; }
+  .error { color: #a40000; }
+  .ok { color: #066006; }
+</style>
+</head>
+<body>
+  <h1>绑定邮箱</h1>
+  <p>验证通过后会回到连接方。</p>
+  ${error}
+  ${sent}
+  <form method="post" action="${escapeHtml(authorizeAction(query))}">
+    <label>邮箱
+      <input name="email" type="email" autocomplete="email" required value="${escapeHtml(email)}">
+    </label>
+    <button type="submit" name="action" value="send">发送验证码</button>
+    <label>验证码
+      <input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}">
+    </label>
+    <button type="submit" name="action" value="verify">验证并继续</button>
+  </form>
+</body>
+</html>`;
+}
+
+function newAuthorizationCode() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  let hex = "";
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
+
+function redirectWithCode(redirectUri, state, code) {
+  const target = new URL(redirectUri);
+  target.searchParams.set("code", code);
+  target.searchParams.set("state", state);
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location: target.toString(),
+      "cache-control": "no-store",
+    },
+  });
+}
+
+async function readAuthorizeForm(request) {
+  if (mediaType(request.headers.get("content-type")) !== "application/x-www-form-urlencoded") {
+    throw new RpcError(-32602, "Content-Type must be application/x-www-form-urlencoded");
+  }
+  const params = new URLSearchParams(await readLimitedBody(request));
+  return {
+    action: params.get("action") || "",
+    email: params.get("email") || "",
+    code: params.get("code") || "",
+  };
+}
+
+async function postOAuthAuthorize(request, query, runtime) {
+  let email = "";
+  try {
+    const form = await readAuthorizeForm(request);
+    email = form.email;
+    if (form.action === "send") {
+      await requestAccountVerification({ email: form.email }, runtime);
+      return html(renderAuthorizePage(query, { email: normalizeAccountEmail(form.email), sent: true }));
+    }
+    if (form.action === "verify") {
+      const normalized = requireAccountEmail({ email: form.email });
+      email = normalized;
+      await assertVerificationCode(runtime, normalized, form.code);
+      const deleted = await queryRun(runtime, "DELETE FROM verification_codes WHERE email = ?", [normalized]);
+      if (changesOf(deleted) !== 1) throw new RpcError(-32602, "invalid verification code");
+      const code = newAuthorizationCode();
+      const codeHash = await sha256Hex(code);
+      const expiresAt = new Date(nowMsOf(runtime) + OAUTH_CODE_TTL_MS).toISOString();
+      await queryRun(
+        runtime,
+        `INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, email, expires_at, used_at)
+         VALUES (?, ?, ?, ?, ?, NULL)`,
+        [codeHash, query.clientId, query.redirectUri, normalized, expiresAt],
+      );
+      return redirectWithCode(query.redirectUri, query.state, code);
+    }
+    throw new RpcError(-32602, "action is invalid");
+  } catch (err) {
+    if (err instanceof RpcError) {
+      const status = err.code === -32603 ? 500 : 400;
+      return html(renderAuthorizePage(query, { email, error: err.message }), status);
+    }
+    console.error(JSON.stringify({ msg: "oauth authorize failed", error: err && err.message }));
+    return html(renderAuthorizePage(query, { email, error: "internal error" }), 500);
+  }
+}
+
+async function handleOAuthAuthorize(request, env, deps) {
+  if (request.method !== "GET" && request.method !== "POST") {
+    return json({ ok: false, error: "method not allowed" }, 405);
+  }
+  try {
+    const query = readOAuthQuery(new URL(request.url));
+    const runtime = oauthRuntime(env, request, deps);
+    const client = await loadOAuthClient(runtime, query.clientId);
+    assertRegisteredRedirect(client, query.redirectUri);
+    if (request.method === "GET") return html(renderAuthorizePage(query, {}));
+    return postOAuthAuthorize(request, query, runtime);
+  } catch (err) {
+    return oauthFail(err);
+  }
+}
+
+function requireBodyString(body, key) {
+  if (!body || typeof body !== "object" || !has(body, key) || typeof body[key] !== "string" || body[key].length === 0) {
+    throw new RpcError(-32602, `${key} is required`);
+  }
+  return body[key];
+}
+
+async function readTokenBody(request) {
+  const media = mediaType(request.headers.get("content-type"));
+  const text = await readLimitedBody(request);
+  if (media === "application/json") {
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new RpcError(-32602, "invalid JSON");
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new RpcError(-32602, "arguments must be an object");
+    }
+    return parsed;
+  }
+  if (media === "application/x-www-form-urlencoded" || media === "") {
+    const params = new URLSearchParams(text);
+    const out = {};
+    for (const key of ["grant_type", "code", "redirect_uri", "client_id", "client_secret"]) {
+      const value = params.get(key);
+      if (value != null) out[key] = value;
+    }
+    return out;
+  }
+  throw new RpcError(-32602, "Content-Type must be application/json or application/x-www-form-urlencoded");
+}
+
+async function handleOAuthToken(request, env, deps) {
+  if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
+  try {
+    const body = await readTokenBody(request);
+    const grantType = requireBodyString(body, "grant_type");
+    if (grantType !== "authorization_code") {
+      throw new RpcError(-32602, "grant_type must be authorization_code");
+    }
+    const code = requireBodyString(body, "code");
+    const redirectUri = requireBodyString(body, "redirect_uri");
+    const clientId = requireBodyString(body, "client_id");
+    const clientSecret = requireBodyString(body, "client_secret");
+    if (!/^[0-9a-f]{64}$/.test(code)) throw new RpcError(-32602, "invalid authorization code");
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(clientId)) throw new RpcError(-32602, "client_id is invalid");
+    const runtime = oauthRuntime(env, request, deps);
+    const client = await loadOAuthClient(runtime, clientId);
+    await assertClientSecret(client, clientSecret);
+    const codeHash = await sha256Hex(code);
+    const row = await queryFirst(
+      runtime,
+      "SELECT client_id, redirect_uri, email, expires_at, used_at FROM oauth_codes WHERE code_hash = ?",
+      [codeHash],
+    );
+    if (!row) throw new RpcError(-32602, "invalid authorization code");
+    if (row.client_id !== clientId) throw new RpcError(-32602, "authorization code mismatch");
+    if (row.redirect_uri !== redirectUri) throw new RpcError(-32602, "redirect_uri mismatch");
+    if (row.used_at != null && row.used_at !== "") {
+      throw new RpcError(-32602, "authorization code already used");
+    }
+    const expiresMs = Date.parse(row.expires_at);
+    if (!Number.isFinite(expiresMs) || nowMsOf(runtime) >= expiresMs) {
+      throw new RpcError(-32602, "authorization code expired");
+    }
+    const email = normalizeAccountEmail(row.email);
+    if (!email) throw new RpcError(-32603, "internal error");
+    const consumed = await queryRun(
+      runtime,
+      "UPDATE oauth_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL",
+      [nowIso(runtime), codeHash],
+    );
+    if (changesOf(consumed) !== 1) throw new RpcError(-32602, "authorization code already used");
+    const token = await issueAccountToken(runtime, email);
+    return json({ access_token: token, token_type: "Bearer" });
+  } catch (err) {
+    return oauthFail(err);
+  }
+}
+
 export async function handleFetch(request, env, deps = {}) {
   const origin = new URL(request.url).origin;
   const path = pathOf(request);
@@ -1625,6 +1983,9 @@ export async function handleFetch(request, env, deps = {}) {
     }
     return json({ jsonrpc: "2.0", id: rpc.id, result: rpc.result });
   }
+
+  if (path === "/oauth/authorize") return handleOAuthAuthorize(request, env, deps);
+  if (path === "/oauth/token") return handleOAuthToken(request, env, deps);
 
   const resource = resourceFromPath(path);
   if (resource) {
