@@ -5,6 +5,10 @@ description: "操作 bot 的个人结构化数据层。用户问起 contacts、c
 
 # abot-data
 
+## 安装
+
+这个 skill 不是 npm 包。把 `skills/abot-data/` 整个目录复制到你所用 agent 的 skills 目录（例如 Claude Code 的 `~/.claude/skills/`），重启 agent 或等它重新扫描后即可用。
+
 ## Purpose
 
 abot-data 是 bot 的个人结构化数据层。MCP 只暴露数据。同步和通知由外部组件做，不要在这个服务里实现同步、发信或部署。
