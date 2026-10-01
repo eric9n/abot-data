@@ -1,0 +1,10 @@
+node_modules/
+
+# Local secrets. Do not commit.
+.prod-token
+.kek_b64
+.dev.vars
+.env
+.env.*
+*.pem
+*.key

@@ -1,0 +1,21 @@
+# Placeholder config for the abot-data Worker.
+#
+# `name` is intentionally `abot-data-unconfigured`, same style as
+# `botu-secrets-unconfigured`. A plain `wrangler deploy` publishes that
+# placeholder Worker only. It does not publish production (data.abot.run).
+# There is no production route in this file.
+#
+# Production deploys are done by the deployer, who injects the real Worker
+# name, the real D1 database_id, routes, and secrets. This repository does
+# not contain secrets.
+
+name = "abot-data-unconfigured"
+main = "src/worker.js"
+compatibility_date = "2026-09-01"
+
+# Binding name is fixed as DB. database_name and database_id below are
+# placeholders. The deployer replaces database_id with the real D1 id.
+[[d1_databases]]
+binding = "DB"
+database_name = "abot-data-unconfigured"
+database_id = "00000000-0000-0000-0000-000000000000"

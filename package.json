@@ -1,0 +1,9 @@
+{
+  "name": "abot-data",
+  "private": true,
+  "type": "module",
+  "description": "Botu's personal structured data layer on Cloudflare Workers and D1, exposed over MCP.",
+  "scripts": {
+    "test": "node --disable-warning=ExperimentalWarning --test"
+  }
+}

@@ -1,0 +1,1 @@
+-- D1 schema for abot-data. Statements added at migration time must be safe to run repeatedly.
