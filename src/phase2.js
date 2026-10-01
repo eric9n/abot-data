@@ -461,6 +461,50 @@ export function createPhase2(api) {
     }
   }
 
+  const DEDUPE_INDEX_SQL = `CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_open
+  ON events(COALESCE(owner_email, ''), dedupe_key) WHERE status = 'pending'`;
+
+  function callerOwner(deps) {
+    if (!deps || typeof deps.ownerEmail !== "string" || deps.ownerEmail === "") return null;
+    return deps.ownerEmail;
+  }
+
+  async function ensureNullableColumn(deps, table, column) {
+    const rows = await queryAll(
+      deps,
+      `SELECT name FROM pragma_table_info('${table}') WHERE name = '${column}'`,
+      [],
+    );
+    if (rows.length > 0) return;
+    try {
+      await queryRun(deps, `ALTER TABLE ${table} ADD COLUMN ${column} TEXT`, []);
+    } catch (err) {
+      const message = err && err.message ? String(err.message) : String(err);
+      if (/duplicate column/i.test(message)) return;
+      throw err;
+    }
+  }
+
+  /** Idempotent: adds owner_email and rebuilds the pending dedupe index once. */
+  async function ensureEventOwnerIsolation(deps) {
+    await ensureNullableColumn(deps, "events", "owner_email");
+    await ensureNullableColumn(deps, "subscriptions", "owner_email");
+    const row = await queryFirst(
+      deps,
+      "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_dedupe_open'",
+      [],
+    );
+    const sql = row && typeof row.sql === "string" ? row.sql : "";
+    if (sql.includes("owner_email")) return;
+    await queryRun(deps, "DROP INDEX IF EXISTS idx_events_dedupe_open", []);
+    await queryRun(deps, DEDUPE_INDEX_SQL, []);
+  }
+
+  function subscriptionAllowed(caller, subOwner) {
+    if (subOwner == null || subOwner === "") return true;
+    return caller != null && caller === subOwner;
+  }
+
   function readNotBefore(value, nowMs) {
     if (value == null) return new Date(nowMs).toISOString();
     const iso = canonicalUtc(value, "not_before");
@@ -548,10 +592,13 @@ export function createPhase2(api) {
   }
 
   async function fanoutEvent(deps, event) {
+    const ownerEmail = event.ownerEmail == null || event.ownerEmail === "" ? null : event.ownerEmail;
     const subs = await queryAll(
       deps,
-      "SELECT id, event_types FROM subscriptions WHERE status = 'active' AND mode = 'webhook'",
-      [],
+      `SELECT id, event_types FROM subscriptions
+WHERE status = 'active' AND mode = 'webhook'
+  AND (owner_email IS NULL OR owner_email = ? OR ? IS NULL)`,
+      [ownerEmail, ownerEmail],
     );
     const nowMs = Date.parse(event.now);
     const visible = Date.parse(event.notBefore) <= nowMs;
@@ -578,29 +625,31 @@ export function createPhase2(api) {
     const now = nowIso(deps);
     const notBefore = spec.notBefore || now;
     const audience = spec.audience == null ? "bot" : spec.audience;
+    const ownerEmail = spec.ownerEmail == null || spec.ownerEmail === "" ? null : spec.ownerEmail;
     await ensureAudienceColumn(deps);
+    await ensureEventOwnerIsolation(deps);
     for (let attempt = 0; attempt < 5; attempt++) {
       const id = newId("evt_");
       try {
         const result = await queryRun(
           deps,
           `INSERT INTO events (
-            id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at, audience
-          ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(dedupe_key) WHERE status = 'pending' DO NOTHING`,
-          [id, spec.type, spec.payloadText, spec.dedupeKey, now, notBefore, spec.source, now, audience],
+            id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at, audience, owner_email
+          ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(COALESCE(owner_email, ''), dedupe_key) WHERE status = 'pending' DO NOTHING`,
+          [id, spec.type, spec.payloadText, spec.dedupeKey, now, notBefore, spec.source, now, audience, ownerEmail],
         );
         if (changesOf(result) === 0) {
           const existing = await queryFirst(
             deps,
-            "SELECT id FROM events WHERE dedupe_key = ? AND status = 'pending'",
-            [spec.dedupeKey],
+            "SELECT id FROM events WHERE dedupe_key = ? AND status = 'pending' AND owner_email IS ?",
+            [spec.dedupeKey, ownerEmail],
           );
           if (!existing) throw new Error("dedupe conflict without row");
           return { id: existing.id, created: false };
         }
         if (spec.type !== "watchdog.queue_dlq") {
-          await fanoutEvent(deps, { id, type: spec.type, notBefore, now });
+          await fanoutEvent(deps, { id, type: spec.type, notBefore, now, ownerEmail });
         }
         return { id, created: true };
       } catch (err) {
@@ -611,7 +660,7 @@ export function createPhase2(api) {
     throw new Error("id entropy exhausted");
   }
 
-  async function listVisible(deps, now, { after, beforeOrEqual, expiredLeaseOnly, limit, audience }) {
+  async function listVisible(deps, now, { after, beforeOrEqual, expiredLeaseOnly, limit, audience, owner }) {
     const where = [
       "status = 'pending'",
       "not_before <= ?",
@@ -621,6 +670,10 @@ export function createPhase2(api) {
     if (audience) {
       where.push("audience = ?");
       params.push(audience);
+    }
+    if (typeof owner === "string") {
+      where.push("(owner_email = ? OR owner_email IS NULL)");
+      params.push(owner);
     }
     if (expiredLeaseOnly) where.push("leased_until IS NOT NULL");
     if (beforeOrEqual) {
@@ -643,9 +696,9 @@ LIMIT ?`,
     );
   }
 
-  async function scanVisible(deps, now, cursor, audience) {
+  async function scanVisible(deps, now, cursor, audience, owner) {
     if (!cursor) {
-      const fetched = await listVisible(deps, now, { limit: SCAN_LIMIT + 1, audience });
+      const fetched = await listVisible(deps, now, { limit: SCAN_LIMIT + 1, audience, owner });
       return { scanned: fetched.slice(0, SCAN_LIMIT), moreUnseen: fetched.length > SCAN_LIMIT };
     }
     const before = await listVisible(deps, now, {
@@ -653,26 +706,27 @@ LIMIT ?`,
       expiredLeaseOnly: true,
       limit: SCAN_LIMIT + 1,
       audience,
+      owner,
     });
     if (before.length > SCAN_LIMIT) {
       return { scanned: before.slice(0, SCAN_LIMIT), moreUnseen: true };
     }
     if (before.length === SCAN_LIMIT) {
-      const peek = await listVisible(deps, now, { after: cursor, limit: 1, audience });
+      const peek = await listVisible(deps, now, { after: cursor, limit: 1, audience, owner });
       return { scanned: before, moreUnseen: peek.length > 0 };
     }
     const room = SCAN_LIMIT - before.length;
-    const after = await listVisible(deps, now, { after: cursor, limit: room + 1, audience });
+    const after = await listVisible(deps, now, { after: cursor, limit: room + 1, audience, owner });
     return {
       scanned: before.concat(after.slice(0, room)),
       moreUnseen: after.length > room,
     };
   }
 
-  async function existsMatchingAfter(deps, now, filters, tuple, audience) {
+  async function existsMatchingAfter(deps, now, filters, tuple, audience, owner) {
     let after = tuple;
     for (let hop = 0; hop < 20; hop++) {
-      const rows = await listVisible(deps, now, { after, limit: SCAN_LIMIT, audience });
+      const rows = await listVisible(deps, now, { after, limit: SCAN_LIMIT, audience, owner });
       if (!rows.length) return false;
       for (const row of rows) {
         if (eventTypeMatches(row.type, filters)) return true;
@@ -684,13 +738,22 @@ LIMIT ?`,
     return true;
   }
 
-  async function retryAfterSeconds(deps, now, filters, audience) {
-    const audienceSql = audience ? " AND audience = ?" : "";
-    const params = audience ? [now, now, audience] : [now, now];
+  async function retryAfterSeconds(deps, now, filters, audience, owner) {
+    const extra = [];
+    const params = [now, now];
+    if (audience) {
+      extra.push("audience = ?");
+      params.push(audience);
+    }
+    if (typeof owner === "string") {
+      extra.push("(owner_email = ? OR owner_email IS NULL)");
+      params.push(owner);
+    }
+    const extraSql = extra.length ? ` AND ${extra.join(" AND ")}` : "";
     const rows = await queryAll(
       deps,
       `SELECT type, leased_until FROM events
-WHERE status = 'pending' AND not_before <= ? AND leased_until IS NOT NULL AND leased_until > ?${audienceSql}`,
+WHERE status = 'pending' AND not_before <= ? AND leased_until IS NOT NULL AND leased_until > ?${extraSql}`,
       params,
     );
     let best = null;
@@ -743,14 +806,21 @@ FROM subscriptions`;
     const audience = readPollAudience(args);
     const cursor = decodeCursor(has(args, "cursor") ? args.cursor : null);
     await ensureWebhookAuthColumn(deps);
-    const sub = await queryFirst(deps, `${SUB_VIEW_SQL} WHERE id = ?`, [args.subscription_id]);
+    await ensureEventOwnerIsolation(deps);
+    const owner = callerOwner(deps);
+    const sub = await queryFirst(
+      deps,
+      "SELECT id, mode, status, event_types, owner_email FROM subscriptions WHERE id = ?",
+      [args.subscription_id],
+    );
     if (!sub) throw notFound();
+    if (!subscriptionAllowed(owner, sub.owner_email)) throw notFound();
     if (sub.status === "paused") throw new RpcError(-32602, "subscription paused");
     if (sub.mode !== "poll" && sub.mode !== "webhook") throw notFound();
     const filters = parseFilters(sub.event_types);
     const now = nowIso(deps);
     if (audience) await ensureAudienceColumn(deps);
-    const scanned = await scanVisible(deps, now, cursor.value, audience);
+    const scanned = await scanVisible(deps, now, cursor.value, audience, owner);
     const matches = [];
     let lastScanned = null;
     for (const row of scanned.scanned) {
@@ -792,13 +862,20 @@ WHERE id = ? AND status = 'pending' AND not_before <= ? AND (leased_until IS NUL
     if (hitScanCap) hasMore = true;
     else if (events.length === limit) {
       const last = events[events.length - 1];
-      hasMore = await existsMatchingAfter(deps, now, filters, { created_at: last.created_at, id: last.id }, audience);
+      hasMore = await existsMatchingAfter(
+        deps,
+        now,
+        filters,
+        { created_at: last.created_at, id: last.id },
+        audience,
+        owner,
+      );
     }
     let nextCursor = null;
     if (hitScanCap) nextCursor = encodeCursor(lastScanned.created_at, lastScanned.id);
     else if (events.length) nextCursor = encodeCursor(events[events.length - 1].created_at, events[events.length - 1].id);
     else nextCursor = cursor.raw;
-    const retry = events.length === 0 && !hasMore ? await retryAfterSeconds(deps, now, filters, audience) : 0;
+    const retry = events.length === 0 && !hasMore ? await retryAfterSeconds(deps, now, filters, audience, owner) : 0;
     return { events, next_cursor: nextCursor, has_more: hasMore, retry_after_seconds: retry };
   }
 
@@ -861,7 +938,15 @@ ON CONFLICT(agent_id) DO UPDATE SET
     const payloadText = serialize(has(args, "payload") ? args.payload : {});
     const notBefore = readNotBefore(has(args, "not_before") ? args.not_before : null, nowMsOf(deps));
     const audience = readEmitAudience(args);
-    return insertBusEvent(deps, { type, dedupeKey, payloadText, notBefore, source: "emit", audience });
+    return insertBusEvent(deps, {
+      type,
+      dedupeKey,
+      payloadText,
+      notBefore,
+      source: "emit",
+      audience,
+      ownerEmail: callerOwner(deps),
+    });
   }
 
   async function createSubscription(args, deps) {
@@ -884,6 +969,8 @@ ON CONFLICT(agent_id) DO UPDATE SET
     }
     const webhookAuth = bearerToken == null ? "hmac" : "bearer";
     await ensureWebhookAuthColumn(deps);
+    await ensureEventOwnerIsolation(deps);
+    const ownerEmail = callerOwner(deps);
     const now = nowIso(deps);
     for (let attempt = 0; attempt < 5; attempt++) {
       const id = newId("sub_");
@@ -898,9 +985,9 @@ ON CONFLICT(agent_id) DO UPDATE SET
         await queryRun(
           deps,
           `INSERT INTO subscriptions (
-            id, mode, status, url, event_types, secret_sealed, webhook_auth, watch_heartbeat, agent_id, created_at, updated_at
-          ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [id, args.mode, url, eventTypes, sealed, webhookAuth, watch, agentId, now, now],
+            id, mode, status, url, event_types, secret_sealed, webhook_auth, watch_heartbeat, agent_id, created_at, updated_at, owner_email
+          ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [id, args.mode, url, eventTypes, sealed, webhookAuth, watch, agentId, now, now, ownerEmail],
         );
         const out = { id, mode: args.mode, status: "active" };
         if (webhookAuth === "hmac" && secret) out.secret = secret;
@@ -1430,7 +1517,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     {
       name: "poll_events",
       description:
-        "按订阅认领可见的 pending 事件。cursor 只翻页，不表示完成。返回 events、next_cursor、has_more、retry_after_seconds。传入 audience 时只返回该受众，不传则返回全部。",
+        "按订阅认领可见的 pending 事件。cursor 只翻页，不表示完成。返回 events、next_cursor、has_more、retry_after_seconds。传入 audience 时只返回该受众，不传则返回全部。账户 token 只返回自己的事件和系统事件；别人的订阅与不存在一样，返回 not found。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1471,7 +1558,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     },
     {
       name: "emit_event",
-      description: "写入一条总线事件。拒绝 watchdog.* 和 calendar.due。新插入成功才扇出 webhook。audience 可选，只能是 bot 或 user，默认 bot。",
+      description: "写入一条总线事件。拒绝 watchdog.* 和 calendar.due。新插入成功才扇出 webhook。audience 可选，只能是 bot 或 user，默认 bot。账户 token 写入的事件属于该邮箱；legacy token 写入系统事件。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1488,7 +1575,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     {
       name: "create_subscription",
       description:
-        "创建 poll 或 webhook 订阅。不传 bearer_token 时 webhook 用 HMAC：服务端生成 secret，只在这次响应里出现。传入 bearer_token 时投递带 Authorization: Bearer，token 不回显。bearer_token 仅 webhook 可用，1 到 500 字符，不能含控制字符或换行。",
+        "创建 poll 或 webhook 订阅。不传 bearer_token 时 webhook 用 HMAC：服务端生成 secret，只在这次响应里出现。传入 bearer_token 时投递带 Authorization: Bearer，token 不回显。bearer_token 仅 webhook 可用，1 到 500 字符，不能含控制字符或换行。订阅记下调用方邮箱；legacy token 创建的订阅没有 owner，视为系统订阅。",
       inputSchema: {
         type: "object",
         properties: {

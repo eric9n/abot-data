@@ -150,7 +150,7 @@ test("account tables reapply and leave legacy owner_email null", () => {
   const db = new DatabaseSync(":memory:");
   db.exec(sql);
   db.exec(sql);
-  for (const table of ["contacts", "calendar_events", "notes"]) {
+  for (const table of ["contacts", "calendar_events", "notes", "events", "subscriptions"]) {
     const column = db.prepare(`SELECT "notnull" AS nn FROM pragma_table_info('${table}') WHERE name = 'owner_email'`).get();
     assert.equal(column.nn, 0);
   }
@@ -472,8 +472,201 @@ test("per-agent tokens isolate contacts, calendar events, and notes", async () =
       dedupe_key: "reminder.medication:acct:2026-09-30T00:00:00.000Z",
     }, { token: ada.token }),
   );
-  const polled = unwrap(await mcp(env, "poll_events", { subscription_id: sub.id }));
+  const polled = unwrap(await mcp(env, "poll_events", { subscription_id: sub.id }, { token: ada.token }));
   assert.equal(polled.events.length, 1);
+  assert.equal(rpcError(await mcp(env, "poll_events", { subscription_id: sub.id }, { token: bea.token })).message, "not found");
+  assert.equal(rpcError(await mcp(env, "poll_events", { subscription_id: sub.id })).message, "not found");
   const beaSubs = unwrap(await mcp(env, "list_subscriptions", {}, { token: bea.token }));
   assert.equal(beaSubs.some((row) => row.id === sub.id), true);
+});
+
+test("event bus isolates owners, system events, and dedupe keys", async () => {
+  const { db, env } = sqliteEnv();
+  env.SUBSCRIPTION_SEAL = Buffer.alloc(32, 7).toString("base64");
+  env.DELIVER_QUEUE = { async send() {} };
+  const ada = await register(env, "ada@example.com", { ip: "203.0.113.80" });
+  const bea = await register(env, "bea@example.com", { ip: "203.0.113.81" });
+  const shared = "reminder.medication:shared";
+  const iso = "2026-09-29T04:00:00.000Z";
+
+  const adaPoll = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }, { token: ada.token }));
+  const beaPoll = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }, { token: bea.token }));
+  const legacyPoll = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }));
+  const adaMed = unwrap(
+    await mcp(env, "create_subscription", { mode: "poll", event_types: ["reminder.medication"] }, { token: ada.token }),
+  );
+  const adaHook = unwrap(
+    await mcp(env, "create_subscription", {
+      mode: "webhook",
+      url: "https://example.com/ada",
+      event_types: ["*"],
+    }, { token: ada.token }),
+  );
+  const beaHook = unwrap(
+    await mcp(env, "create_subscription", {
+      mode: "webhook",
+      url: "https://example.com/bea",
+      event_types: ["*"],
+    }, { token: bea.token }),
+  );
+  const legacyHook = unwrap(
+    await mcp(env, "create_subscription", {
+      mode: "webhook",
+      url: "https://example.com/legacy",
+      event_types: ["*"],
+    }),
+  );
+  assert.equal(db.prepare("SELECT owner_email FROM subscriptions WHERE id = ?").get(adaPoll.id).owner_email, "ada@example.com");
+  assert.equal(db.prepare("SELECT owner_email FROM subscriptions WHERE id = ?").get(beaHook.id).owner_email, "bea@example.com");
+  assert.equal(db.prepare("SELECT owner_email FROM subscriptions WHERE id = ?").get(legacyPoll.id).owner_email, null);
+
+  db.prepare(
+    `INSERT INTO events (
+      id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at, audience, owner_email
+    ) VALUES ('evt_stocklegacy1', 'reminder.medication', '{"who":"stock"}', 'pending', 'reminder.medication:stock', ?, ?, 'emit', ?, 'bot', NULL)`,
+  ).run(iso, iso, iso);
+
+  const adaEv = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: shared,
+      payload: { who: "ada" },
+    }, { token: ada.token }),
+  );
+  const adaAgain = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: shared,
+      payload: { who: "ada-changed" },
+    }, { token: ada.token }),
+  );
+  assert.equal(adaEv.created, true);
+  assert.equal(adaAgain.created, false);
+  assert.equal(adaAgain.id, adaEv.id);
+  const beaEv = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: shared,
+      payload: { who: "bea" },
+    }, { token: bea.token }),
+  );
+  const beaAgain = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: shared,
+      payload: { who: "bea-changed" },
+    }, { token: bea.token }),
+  );
+  assert.equal(beaEv.created, true);
+  assert.notEqual(beaEv.id, adaEv.id);
+  assert.equal(beaAgain.created, false);
+  assert.equal(beaAgain.id, beaEv.id);
+  const legacyEv = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: shared,
+      payload: { who: "legacy" },
+    }),
+  );
+  const legacyAgain = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: shared,
+      payload: { who: "legacy-changed" },
+    }),
+  );
+  assert.equal(legacyEv.created, true);
+  assert.equal(legacyAgain.created, false);
+  assert.equal(legacyAgain.id, legacyEv.id);
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(adaEv.id).owner_email, "ada@example.com");
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(beaEv.id).owner_email, "bea@example.com");
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(legacyEv.id).owner_email, null);
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = 'evt_stocklegacy1'").get().owner_email, null);
+  assert.equal(JSON.parse(db.prepare("SELECT payload FROM events WHERE id = ?").get(adaEv.id).payload).who, "ada");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE dedupe_key = ?").get(shared).n, 3);
+
+  function deliveryCount(id) {
+    return db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE subscription_id = ?").get(id).n;
+  }
+  assert.equal(deliveryCount(legacyHook.id), 3);
+  assert.equal(deliveryCount(adaHook.id), 2);
+  assert.equal(deliveryCount(beaHook.id), 2);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE event_id = ? AND subscription_id = ?").get(beaEv.id, adaHook.id).n,
+    0,
+  );
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE event_id = ? AND subscription_id = ?").get(adaEv.id, beaHook.id).n,
+    0,
+  );
+
+  function whos(page) {
+    return page.events.map((row) => row.payload.who).sort();
+  }
+  const adaPage = unwrap(
+    await mcp(env, "poll_events", { subscription_id: adaPoll.id, visibility_seconds: 30 }, { token: ada.token, nowMs: NOW }),
+  );
+  assert.deepEqual(whos(adaPage), ["ada", "legacy", "stock"]);
+  const beaPage = unwrap(
+    await mcp(env, "poll_events", {
+      subscription_id: beaPoll.id,
+      visibility_seconds: 30,
+    }, { token: bea.token, nowMs: NOW + 31000 }),
+  );
+  assert.deepEqual(whos(beaPage), ["bea", "legacy", "stock"]);
+  const legacyPage = unwrap(
+    await mcp(env, "poll_events", { subscription_id: legacyPoll.id, visibility_seconds: 30 }, { nowMs: NOW + 62000 }),
+  );
+  assert.deepEqual(whos(legacyPage), ["ada", "bea", "legacy", "stock"]);
+  const adaSystem = unwrap(
+    await mcp(env, "poll_events", {
+      subscription_id: legacyPoll.id,
+      visibility_seconds: 30,
+    }, { token: ada.token, nowMs: NOW + 93000 }),
+  );
+  assert.deepEqual(whos(adaSystem), ["ada", "legacy", "stock"]);
+
+  assert.equal(rpcError(await mcp(env, "poll_events", { subscription_id: adaPoll.id }, { token: bea.token })).message, "not found");
+  assert.equal(rpcError(await mcp(env, "poll_events", { subscription_id: beaPoll.id }, { token: ada.token })).message, "not found");
+  assert.equal(rpcError(await mcp(env, "poll_events", { subscription_id: adaPoll.id })).message, "not found");
+  assert.equal(
+    rpcError(await mcp(env, "poll_events", { subscription_id: "sub_doesnotexist" }, { token: ada.token })).message,
+    "not found",
+  );
+
+  const follow = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.followup",
+      dedupe_key: "reminder.followup:ada-user",
+      audience: "user",
+      payload: { who: "ada-user" },
+    }, { token: ada.token, nowMs: NOW + 124000 }),
+  );
+  const medPage = unwrap(
+    await mcp(env, "poll_events", {
+      subscription_id: adaMed.id,
+      audience: "bot",
+      visibility_seconds: 30,
+    }, { token: ada.token, nowMs: NOW + 124000 }),
+  );
+  assert.deepEqual(whos(medPage), ["ada", "legacy", "stock"]);
+  assert.equal(medPage.events.some((row) => row.id === follow.id), false);
+  const userPage = unwrap(
+    await mcp(env, "poll_events", {
+      subscription_id: adaPoll.id,
+      audience: "user",
+      visibility_seconds: 30,
+    }, { token: ada.token, nowMs: NOW + 124000 }),
+  );
+  assert.deepEqual(whos(userPage), ["ada-user"]);
+
+  const bad = await mcp(env, "emit_event", {
+    type: "reminder.medication",
+    dedupe_key: "reminder.medication:forged",
+  }, { token: "not-a-token" });
+  assert.equal(bad.status, 401);
+  assert.deepEqual(bad.body, { ok: false, error: "unauthorized" });
+  const unknown = await mcp(env, "poll_events", { subscription_id: adaPoll.id }, { token: `ad_${"cd".repeat(16)}` });
+  assert.equal(unknown.status, 401);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE dedupe_key = 'reminder.medication:forged'").get().n, 0);
 });
