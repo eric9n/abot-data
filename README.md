@@ -2,6 +2,8 @@
 
 abot-data 是 bot 的个人结构化数据层，跑在 Cloudflare Workers + D1 上，对外以 MCP 协议提供服务。
 
+接入用法见 [docs/USAGE.md](docs/USAGE.md)。
+
 ## 架构
 
 MCP 只做数据暴露。同步逻辑在外部组件，不在本仓库。
