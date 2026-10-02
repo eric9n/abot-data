@@ -25,6 +25,7 @@ import {
 } from "./phase2.js";
 
 export { buildWebhookBody, signWebhook, stableStringify, verifyWebhookRequest };
+export { Scheduler } from "./scheduler.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const MAX_BODY_BYTES = 1_000_000;
@@ -596,6 +597,41 @@ async function deleteContact(args, deps) {
   return { id, deleted: true };
 }
 
+// Scheduler DO integration: best-effort, never fails the CRUD operation.
+async function schedulerDO(deps) {
+  try {
+    const ns = deps && deps.env && deps.env.SCHEDULER;
+    if (!ns) return null;
+    return ns.get(ns.idFromName("global"));
+  } catch {
+    return null;
+  }
+}
+
+async function scheduleCalendarDue(deps, eventId, startUtc) {
+  const stub = await schedulerDO(deps);
+  if (!stub) return;
+  try {
+    const dueMs = Date.parse(startUtc);
+    if (!Number.isFinite(dueMs)) return;
+    // Only schedule future events
+    if (dueMs <= Date.now()) return;
+    await stub.schedule(`calendar:${eventId}`, dueMs, "calendar.due", { eventId });
+  } catch (err) {
+    console.error(JSON.stringify({ msg: "scheduleCalendarDue failed", error: err && err.message }));
+  }
+}
+
+async function cancelCalendarDue(deps, eventId) {
+  const stub = await schedulerDO(deps);
+  if (!stub) return;
+  try {
+    await stub.cancel(`calendar:${eventId}`);
+  } catch (err) {
+    console.error(JSON.stringify({ msg: "cancelCalendarDue failed", error: err && err.message }));
+  }
+}
+
 async function createEvent(args, deps) {
   requireArgs(args);
   assertOnlyKeys(
@@ -637,7 +673,10 @@ async function createEvent(args, deps) {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, 'bot', ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?)`,
     [title, start, end, timezone, allDay, repeat, attendees, reminders, location ?? null, notes ?? null, createdBy, now, now, owner],
   );
-  return { id, url: canonicalUrl(deps && deps.origin, id) };
+  const result = { id, url: canonicalUrl(deps && deps.origin, id) };
+  // Schedule precise due alarm (cron remains as backfill)
+  await scheduleCalendarDue(deps, id, start);
+  return result;
 }
 
 async function getEvent(args, deps) {
@@ -742,6 +781,12 @@ async function updateEvent(args, deps) {
   params.push(now, ...ownerParams);
   await queryRun(deps, `UPDATE calendar_events SET ${sets.join(", ")} WHERE id = ?${filter}`, params);
   const row = await queryFirst(deps, `SELECT ${EVENT_FIELDS} FROM calendar_events WHERE id = ?${filter}`, ownerParams);
+  // Reschedule or cancel based on new state
+  if (row.status === "cancelled") {
+    await cancelCalendarDue(deps, id);
+  } else if (row.start_utc) {
+    await scheduleCalendarDue(deps, id, row.start_utc);
+  }
   return { found: true, ...eventView(row, deps.origin) };
 }
 
@@ -755,6 +800,7 @@ async function deleteEvent(args, deps) {
   if (!existing) throw notFound();
   const now = nowIso(deps);
   await queryRun(deps, `UPDATE calendar_events SET status = 'cancelled', updated_at = ? WHERE id = ?${filter}`, [now, ...params]);
+  await cancelCalendarDue(deps, id);
   return { id, status: "cancelled" };
 }
 
@@ -1952,6 +1998,37 @@ async function postOAuthAuthorize(request, query, runtime) {
   }
 }
 
+async function handleSchedulerDue(request, env, deps) {
+  if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
+  const secret = request.headers.get("x-scheduler-secret");
+  if (!env.SCHEDULER_SECRET || secret !== env.SCHEDULER_SECRET) {
+    return json({ ok: false, error: "forbidden" }, 403);
+  }
+  try {
+    const body = await request.json().catch(() => null);
+    const triggers = body && Array.isArray(body.triggers) ? body.triggers : [];
+    const runtime = phase2.bindRuntime(env, { nowMs: deps.nowMs, origin: new URL(request.url).origin });
+    const results = [];
+    for (const t of triggers) {
+      if (!t || typeof t.id !== "string") continue;
+      try {
+        if (t.type === "calendar.due") {
+          const eventId = (t.payload && t.payload.eventId) || t.id.replace(/^calendar:/, "");
+          const emitted = await phase2.emitCalendarDueForEvent(runtime, eventId, "scheduler");
+          results.push({ id: t.id, emitted });
+        } else {
+          results.push({ id: t.id, emitted: false, reason: "unknown type" });
+        }
+      } catch (err) {
+        results.push({ id: t.id, emitted: false, reason: err && err.message });
+      }
+    }
+    return json({ ok: true, results });
+  } catch (err) {
+    return json({ ok: false, error: "internal error" }, 500);
+  }
+}
+
 async function handleOAuthAuthorize(request, env, deps) {
   if (request.method !== "GET" && request.method !== "POST") {
     return json({ ok: false, error: "method not allowed" }, 405);
@@ -2221,6 +2298,8 @@ export async function handleFetch(request, env, deps = {}) {
     }
     return json({ jsonrpc: "2.0", id: rpc.id, result: rpc.result });
   }
+
+  if (path === "/internal/scheduler-due") return handleSchedulerDue(request, env, deps);
 
   if (path === "/oauth/authorize") return handleOAuthAuthorize(request, env, deps);
   if (path === "/oauth/token") return handleOAuthToken(request, env, deps);
