@@ -510,6 +510,7 @@ async function createContact(args, deps) {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?)`,
     [name, aliases, org ?? null, title ?? null, email ?? null, phone ?? null, relation ?? null, notes ?? null, createdBy, now, now, owner],
   );
+  await emitRuleEvent(deps, "contact.created", "contact_id", id);
   return { id, url: canonicalUrl(deps && deps.origin, id) };
 }
 
@@ -607,6 +608,7 @@ async function updateContact(args, deps) {
   if (ownerParams.length > 1) params.push(ownerParams[1]);
   await queryRun(deps, `UPDATE contacts SET ${sets.join(", ")} WHERE id = ?${ownerFilter}`, params);
   const row = await queryFirst(deps, `SELECT ${CONTACT_FIELDS} FROM contacts WHERE id = ?${ownerFilter}`, ownerParams);
+  await emitRuleEvent(deps, "contact.updated", "contact_id", id);
   return { found: true, ...contactView(row, deps.origin) };
 }
 
@@ -619,7 +621,25 @@ async function deleteContact(args, deps) {
   const existing = await queryFirst(deps, `SELECT id FROM contacts WHERE id = ?${filter}`, params);
   if (!existing) throw notFound();
   await queryRun(deps, `DELETE FROM contacts WHERE id = ?${filter}`, params);
+  await emitRuleEvent(deps, "contact.deleted", "contact_id", id);
   return { id, deleted: true };
+}
+
+// Rule event emission: bypass, best-effort, never fails the CRUD operation.
+async function emitRuleEvent(deps, type, entityIdField, entityId) {
+  try {
+    const q = deps && deps.env && deps.env.RULE_EVENTS;
+    if (!q || typeof q.send !== "function") return;
+    await q.send({
+      event_id: `evt_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`,
+      type,
+      at: new Date().toISOString(),
+      source: "abot-data",
+      [entityIdField]: entityId,
+    });
+  } catch (e) {
+    console.error(JSON.stringify({msg: "rule event send failed", error: e && e.message}));
+  }
 }
 
 // Scheduler DO integration: best-effort, never fails the CRUD operation.
@@ -701,6 +721,7 @@ async function createEvent(args, deps) {
   const result = { id, url: canonicalUrl(deps && deps.origin, id) };
   // Schedule precise due alarm (cron remains as backfill)
   await scheduleCalendarDue(deps, id, start);
+  await emitRuleEvent(deps, "calendar.created", "calendar_id", id);
   return result;
 }
 
@@ -812,6 +833,7 @@ async function updateEvent(args, deps) {
   } else if (row.start_utc) {
     await scheduleCalendarDue(deps, id, row.start_utc);
   }
+  await emitRuleEvent(deps, "calendar.updated", "calendar_id", id);
   return { found: true, ...eventView(row, deps.origin) };
 }
 
@@ -826,6 +848,7 @@ async function deleteEvent(args, deps) {
   const now = nowIso(deps);
   await queryRun(deps, `UPDATE calendar_events SET status = 'cancelled', updated_at = ? WHERE id = ?${filter}`, [now, ...params]);
   await cancelCalendarDue(deps, id);
+  await emitRuleEvent(deps, "calendar.deleted", "calendar_id", id);
   return { id, status: "cancelled" };
 }
 
@@ -847,6 +870,7 @@ async function createNote(args, deps) {
     ) VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?)`,
     [title, body, tags, links, createdBy, now, now, owner],
   );
+  await emitRuleEvent(deps, "note.created", "note_id", id);
   return { id, url: canonicalUrl(deps && deps.origin, id) };
 }
 
@@ -919,6 +943,7 @@ async function updateNote(args, deps) {
   params.push(now, ...ownerParams);
   await queryRun(deps, `UPDATE notes SET ${sets.join(", ")} WHERE id = ?${filter}`, params);
   const row = await queryFirst(deps, `SELECT ${NOTE_FIELDS} FROM notes WHERE id = ?${filter}`, ownerParams);
+  await emitRuleEvent(deps, "note.updated", "note_id", id);
   return { found: true, ...noteView(row, deps.origin) };
 }
 
@@ -931,6 +956,7 @@ async function deleteNote(args, deps) {
   const existing = await queryFirst(deps, `SELECT id FROM notes WHERE id = ?${filter}`, params);
   if (!existing) throw notFound();
   await queryRun(deps, `DELETE FROM notes WHERE id = ?${filter}`, params);
+  await emitRuleEvent(deps, "note.deleted", "note_id", id);
   return { id, deleted: true };
 }
 
