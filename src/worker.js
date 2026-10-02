@@ -1679,7 +1679,8 @@ function readOAuthQuery(url) {
   if (scope != null && (scope.length > 512 || /[\u0000-\u001F\u007F]/.test(scope))) {
     throw new RpcError(-32602, "scope is invalid");
   }
-  return { clientId, redirectUri, state, scope: scope || "", ...readPkceParams(url) };
+  const loginHint = normalizeAccountEmail(url.searchParams.get("login_hint"));
+  return { clientId, redirectUri, state, scope: scope || "", loginHint, ...readPkceParams(url) };
 }
 
 function blankToNull(value) {
@@ -1822,6 +1823,7 @@ function authorizeAction(query) {
     params.set("code_challenge", query.codeChallenge);
     params.set("code_challenge_method", "S256");
   }
+  if (query.loginHint) params.set("login_hint", query.loginHint);
   return `/oauth/authorize?${params.toString()}`;
 }
 
@@ -1948,7 +1950,7 @@ async function handleOAuthAuthorize(request, env, deps) {
     if (!clientHasSecret(client) && !query.codeChallenge) {
       throw new RpcError(-32602, "code_challenge is required");
     }
-    if (request.method === "GET") return html(renderAuthorizePage(query, {}));
+    if (request.method === "GET") return html(renderAuthorizePage(query, { email: query.loginHint || "" }));
     return postOAuthAuthorize(request, query, runtime);
   } catch (err) {
     return oauthFail(err);
