@@ -1004,6 +1004,10 @@ ON CONFLICT(agent_id) DO UPDATE SET
     assertOnlyKeys(args, new Set(["id"]));
     const id = requireId(args.id, "sub_");
     await ensureWebhookAuthColumn(deps);
+    await ensureEventOwnerIsolation(deps);
+    const ownerRow = await queryFirst(deps, "SELECT owner_email FROM subscriptions WHERE id = ?", [id]);
+    if (!ownerRow) throw notFound();
+    if (!subscriptionAllowed(callerOwner(deps), ownerRow.owner_email)) throw notFound();
     const row = await queryFirst(deps, `${SUB_VIEW_SQL} WHERE id = ?`, [id]);
     if (!row) throw notFound();
     return subscriptionView(row);
@@ -1014,12 +1018,23 @@ ON CONFLICT(agent_id) DO UPDATE SET
     assertOnlyKeys(args, new Set(["limit"]));
     const limit = clampLimit(args.limit, 20, 100);
     await ensureWebhookAuthColumn(deps);
+    await ensureEventOwnerIsolation(deps);
+    // Account callers see their own subscriptions plus system (unowned) ones.
+    // Legacy callers see everything.
+    const owner = callerOwner(deps);
+    const where = [];
+    const params = [];
+    if (owner != null) {
+      where.push("(owner_email = ? OR owner_email IS NULL)");
+      params.push(owner);
+    }
+    params.push(limit);
     const rows = await queryAll(
       deps,
-      `${SUB_VIEW_SQL}
+      `${SUB_VIEW_SQL}${where.length ? `\nWHERE ${where.join(" AND ")}` : ""}
 ORDER BY created_at ASC, id ASC
 LIMIT ?`,
-      [limit],
+      params,
     );
     return rows.map(subscriptionView);
   }
@@ -1028,8 +1043,9 @@ LIMIT ?`,
     requireArgs(args);
     assertOnlyKeys(args, new Set(["id", "url", "event_types", "status", "watch_heartbeat", "agent_id"]));
     const id = requireId(args.id, "sub_");
-    const existing = await queryFirst(deps, "SELECT id, mode, status FROM subscriptions WHERE id = ?", [id]);
+    const existing = await queryFirst(deps, "SELECT id, mode, status, owner_email FROM subscriptions WHERE id = ?", [id]);
     if (!existing) throw notFound();
+    if (!subscriptionAllowed(callerOwner(deps), existing.owner_email)) throw notFound();
     const sets = [];
     const params = [];
     if (has(args, "url")) {
@@ -1087,8 +1103,9 @@ WHERE subscription_id = ? AND state = 'paused'`,
     requireArgs(args);
     assertOnlyKeys(args, new Set(["id"]));
     const id = requireId(args.id, "sub_");
-    const existing = await queryFirst(deps, "SELECT id FROM subscriptions WHERE id = ?", [id]);
+    const existing = await queryFirst(deps, "SELECT id, owner_email FROM subscriptions WHERE id = ?", [id]);
     if (!existing) throw notFound();
+    if (!subscriptionAllowed(callerOwner(deps), existing.owner_email)) throw notFound();
     const now = nowIso(deps);
     await queryRun(
       deps,
@@ -1105,8 +1122,9 @@ WHERE subscription_id = ? AND state IN ('due', 'inflight', 'paused')`,
     assertOnlyKeys(args, new Set(["id", "bearer_token"]));
     const id = requireId(args.id, "sub_");
     await ensureWebhookAuthColumn(deps);
-    const existing = await queryFirst(deps, "SELECT id, mode, webhook_auth FROM subscriptions WHERE id = ?", [id]);
+    const existing = await queryFirst(deps, "SELECT id, mode, webhook_auth, owner_email FROM subscriptions WHERE id = ?", [id]);
     if (!existing) throw notFound();
+    if (!subscriptionAllowed(callerOwner(deps), existing.owner_email)) throw notFound();
     if (existing.mode !== "webhook") throw new RpcError(-32602, "subscription has no webhook secret");
     const bearer = existing.webhook_auth === "bearer";
     if (bearer) {

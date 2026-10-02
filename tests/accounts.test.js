@@ -477,7 +477,11 @@ test("per-agent tokens isolate contacts, calendar events, and notes", async () =
   assert.equal(rpcError(await mcp(env, "poll_events", { subscription_id: sub.id }, { token: bea.token })).message, "not found");
   assert.equal(rpcError(await mcp(env, "poll_events", { subscription_id: sub.id })).message, "not found");
   const beaSubs = unwrap(await mcp(env, "list_subscriptions", {}, { token: bea.token }));
-  assert.equal(beaSubs.some((row) => row.id === sub.id), true);
+  assert.equal(beaSubs.some((row) => row.id === sub.id), false);
+  // get/update/delete/rotate on another owner's subscription must fail
+  assert.equal(rpcError(await mcp(env, "get_subscription", { id: sub.id }, { token: bea.token })).message, "not found");
+  assert.equal(rpcError(await mcp(env, "update_subscription", { id: sub.id, status: "paused" }, { token: bea.token })).message, "not found");
+  assert.equal(rpcError(await mcp(env, "delete_subscription", { id: sub.id }, { token: bea.token })).message, "not found");
 });
 
 test("event bus isolates owners, system events, and dedupe keys", async () => {
@@ -669,4 +673,42 @@ test("event bus isolates owners, system events, and dedupe keys", async () => {
   const unknown = await mcp(env, "poll_events", { subscription_id: adaPoll.id }, { token: `ad_${"cd".repeat(16)}` });
   assert.equal(unknown.status, 401);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE dedupe_key = 'reminder.medication:forged'").get().n, 0);
+});
+
+test("gateway internal header scopes requests to the bound account", async () => {
+  const { db, env } = sqliteEnv();
+  env.INTERNAL_TOKEN = "internal-secret";
+  const ada = await register(env, "ada@example.com", { ip: "203.0.113.90" });
+  const bea = await register(env, "bea@example.com", { ip: "203.0.113.91" });
+  const adaContact = unwrap(await mcp(env, "create_contact", { name: "Ada contact" }, { token: ada.token }));
+  const beaContact = unwrap(await mcp(env, "create_contact", { name: "Bea contact" }, { token: bea.token }));
+
+  async function gwMcp(name, args, ownerEmail, internalToken = "internal-secret") {
+    const headers = { "content-type": "application/json", "x-internal-token": internalToken };
+    if (ownerEmail !== undefined) headers["x-abot-owner-email"] = ownerEmail;
+    const res = await handleFetch(
+      new Request("https://abot-data.test/mcp", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args ?? {} } }),
+      }),
+      env,
+      { nowMs: NOW },
+    );
+    const text = await res.text();
+    return { status: res.status, body: text ? JSON.parse(text) : null };
+  }
+
+  // Gateway with owner header: sees only that account's rows
+  const adaSeen = unwrap(await gwMcp("list_contacts", {}, "ada@example.com")).map((r) => r.id);
+  assert.deepEqual(adaSeen, [adaContact.id]);
+  // Cross-account read via gateway header is blocked
+  assert.equal(unwrap(await gwMcp("get_contact", { id: beaContact.id }, "ada@example.com")).found, false);
+  // Invalid owner email header is rejected
+  assert.equal((await gwMcp("list_contacts", {}, "not-an-email")).status, 401);
+  // Wrong internal token is rejected
+  assert.equal((await gwMcp("list_contacts", {}, "ada@example.com", "wrong")).status, 401);
+  // No owner header: legacy full access (system/cron path)
+  const allSeen = unwrap(await gwMcp("list_contacts", {}, undefined)).map((r) => r.id).sort();
+  assert.deepEqual(allSeen, [adaContact.id, beaContact.id].sort());
 });

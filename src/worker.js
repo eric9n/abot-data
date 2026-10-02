@@ -631,7 +631,10 @@ async function emitRuleEvent(deps, type, entityIdField, entityId) {
     const q = deps && deps.env && deps.env.RULE_EVENTS;
     if (!q || typeof q.send !== "function") return;
     await q.send({
-      event_id: `evt_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`,
+      event_id: `evt_${Date.now().toString(36)}${Array.from(crypto.getRandomValues(new Uint8Array(4)))
+        .map((b) => b.toString(36))
+        .join("")
+        .slice(0, 8)}`,
       type,
       at: new Date().toISOString(),
       source: "abot-data",
@@ -1633,9 +1636,17 @@ async function accountEmailForToken(env, token) {
 }
 
 async function resolveBearer(request, env) {
-  // 内部鉴权：网关透传，X-Internal-Token 有效则信任（网关已做对外鉴权）
+  // Internal auth: the gateway forwards after its own external auth.
+  // X-Internal-Token is checked timing-safe. When the gateway also passes
+  // X-Abot-Owner-Email, the request is scoped to that account (never legacy).
   const it = request.headers.get("x-internal-token") || "";
-  if (env.INTERNAL_TOKEN && it === env.INTERNAL_TOKEN) {
+  if (env.INTERNAL_TOKEN && timingSafeEqual(it, env.INTERNAL_TOKEN)) {
+    const ownerHeader = request.headers.get("x-abot-owner-email");
+    if (ownerHeader != null && ownerHeader !== "") {
+      const email = normalizeAccountEmail(ownerHeader);
+      if (!email) return { kind: "unauthorized" };
+      return { kind: "account", email };
+    }
     return { kind: "legacy" };
   }
   const header = request.headers.get("authorization");
@@ -1776,6 +1787,13 @@ function readOAuthQuery(url) {
   }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
     throw new RpcError(-32602, "redirect_uri is invalid");
+  }
+  // http is only for local development (localhost). Public clients must use https.
+  if (parsed.protocol === "http:") {
+    const host = parsed.hostname.toLowerCase();
+    if (host !== "localhost" && host !== "127.0.0.1" && host !== "[::1]") {
+      throw new RpcError(-32602, "redirect_uri must be https");
+    }
   }
   if (typeof state !== "string" || state.length === 0 || state.length > 512 || /[\u0000-\u001F\u007F]/.test(state)) {
     throw new RpcError(-32602, "state is invalid");
@@ -2057,7 +2075,7 @@ async function postOAuthAuthorize(request, query, runtime) {
 async function handleSchedulerDue(request, env, deps) {
   if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
   const secret = request.headers.get("x-scheduler-secret");
-  if (!env.SCHEDULER_SECRET || secret !== env.SCHEDULER_SECRET) {
+  if (!env.SCHEDULER_SECRET || !timingSafeEqual(secret || "", env.SCHEDULER_SECRET)) {
     return json({ ok: false, error: "forbidden" }, 403);
   }
   try {
