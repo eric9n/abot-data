@@ -622,6 +622,23 @@ async function deleteContact(args, deps) {
   return { id, deleted: true };
 }
 
+// Rule event emission: bypass, best-effort, never fails the CRUD operation.
+async function emitRuleEvent(deps, type, entityIdField, entityId) {
+  try {
+    const q = deps && deps.env && deps.env.RULE_EVENTS;
+    if (!q || typeof q.send !== "function") return;
+    await q.send({
+      event_id: `evt_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`,
+      type,
+      at: new Date().toISOString(),
+      source: "abot-data",
+      [entityIdField]: entityId,
+    });
+  } catch (e) {
+    console.error(JSON.stringify({msg: "rule event send failed", error: e && e.message}));
+  }
+}
+
 // Scheduler DO integration: best-effort, never fails the CRUD operation.
 async function schedulerDO(deps) {
   try {
@@ -701,6 +718,7 @@ async function createEvent(args, deps) {
   const result = { id, url: canonicalUrl(deps && deps.origin, id) };
   // Schedule precise due alarm (cron remains as backfill)
   await scheduleCalendarDue(deps, id, start);
+  await emitRuleEvent(deps, "calendar.created", "calendar_id", id);
   return result;
 }
 
@@ -812,6 +830,7 @@ async function updateEvent(args, deps) {
   } else if (row.start_utc) {
     await scheduleCalendarDue(deps, id, row.start_utc);
   }
+  await emitRuleEvent(deps, "calendar.updated", "calendar_id", id);
   return { found: true, ...eventView(row, deps.origin) };
 }
 
@@ -826,6 +845,7 @@ async function deleteEvent(args, deps) {
   const now = nowIso(deps);
   await queryRun(deps, `UPDATE calendar_events SET status = 'cancelled', updated_at = ? WHERE id = ?${filter}`, [now, ...params]);
   await cancelCalendarDue(deps, id);
+  await emitRuleEvent(deps, "calendar.deleted", "calendar_id", id);
   return { id, status: "cancelled" };
 }
 
