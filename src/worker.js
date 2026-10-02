@@ -2130,6 +2130,35 @@ export async function handleFetch(request, env, deps = {}) {
   const origin = new URL(request.url).origin;
   const path = pathOf(request);
 
+  // RFC 8414: OAuth 2.0 Authorization Server Metadata
+  if (path === "/.well-known/oauth-authorization-server") {
+    if (request.method !== "GET") return json({ ok: false, error: "method not allowed" }, 405);
+    const base = new URL(request.url).origin;
+    return json({
+      issuer: base,
+      authorization_endpoint: base + "/oauth/authorize",
+      token_endpoint: base + "/oauth/token",
+      registration_endpoint: base + "/oauth/register",
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code"],
+      token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
+      code_challenge_methods_supported: ["S256"],
+      scopes_supported: [],
+    });
+  }
+
+  // RFC 9728: OAuth 2.0 Protected Resource Metadata
+  if (path === "/.well-known/oauth-protected-resource") {
+    if (request.method !== "GET") return json({ ok: false, error: "method not allowed" }, 405);
+    const base = new URL(request.url).origin;
+    return json({
+      resource: base + "/mcp",
+      authorization_servers: [base],
+      bearer_methods_supported: ["header"],
+      scopes_supported: [],
+    });
+  }
+
   if (path === "/health") {
     if (request.method !== "GET") return json({ ok: false, error: "method not allowed" }, 405);
     try {
@@ -2142,15 +2171,27 @@ export async function handleFetch(request, env, deps = {}) {
     }
   }
 
+  // 401 with WWW-Authenticate pointing to RFC 9728 resource metadata
+  function unauthorizedMcp(request) {
+    const base = new URL(request.url).origin;
+    return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), {
+      status: 401,
+      headers: {
+        "content-type": "application/json",
+        "www-authenticate": `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource"`,
+      },
+    });
+  }
+
   if (path === "/mcp") {
     if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
     let identity = await resolveBearer(request, env);
     if (identity.kind === "error") return json({ ok: false }, 500);
-    if (identity.kind === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
+    if (identity.kind === "unauthorized") return unauthorizedMcp(request);
     let message = null;
     if (identity.kind === "anonymous") {
       message = await readPublicAccountCall(request);
-      if (!message) return json({ ok: false, error: "unauthorized" }, 401);
+      if (!message) return unauthorizedMcp(request);
       identity = { kind: "public" };
     }
     if (!message) {
