@@ -1962,7 +1962,21 @@ async function handleOAuthAuthorize(request, env, deps) {
     if (!clientHasSecret(client) && !query.codeChallenge) {
       throw new RpcError(-32602, "code_challenge is required");
     }
-    if (request.method === "GET") return html(renderAuthorizePage(query, { email: query.loginHint || "" }));
+    if (request.method === "GET") {
+      const hintEmail = query.loginHint || "";
+      // Auto-send verification code when login_hint is present: one-step flow.
+      if (hintEmail) {
+        try {
+          await requestAccountVerification({ email: hintEmail }, runtime);
+          return html(renderAuthorizePage(query, { email: hintEmail, sent: true }));
+        } catch (err) {
+          // Fall through to manual page on rate-limit etc.
+          const msg = err instanceof RpcError ? err.message : "internal error";
+          return html(renderAuthorizePage(query, { email: hintEmail, error: msg }), 400);
+        }
+      }
+      return html(renderAuthorizePage(query, { email: "" }));
+    }
     return postOAuthAuthorize(request, query, runtime);
   } catch (err) {
     return oauthFail(err);
@@ -2007,6 +2021,44 @@ async function readTokenBody(request) {
     return out;
   }
   throw new RpcError(-32602, "Content-Type must be application/json or application/x-www-form-urlencoded");
+}
+
+async function handleOAuthRegister(request, env, deps) {
+  if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
+  try {
+    const body = await request.json().catch(() => null);
+    if (!body || typeof body !== "object") throw new RpcError(-32602, "invalid JSON body");
+    const redirectUris = body.redirect_uris;
+    if (!Array.isArray(redirectUris) || redirectUris.length === 0 || redirectUris.length > 10) {
+      throw new RpcError(-32602, "redirect_uris must be a non-empty array (max 10)");
+    }
+    for (const uri of redirectUris) {
+      if (typeof uri !== "string" || uri.length === 0 || uri.length > 2048 || /[\s]/.test(uri)) {
+        throw new RpcError(-32602, "invalid redirect_uri");
+      }
+      let parsed;
+      try { parsed = new URL(uri); } catch { throw new RpcError(-32602, "invalid redirect_uri"); }
+      if (parsed.protocol !== "https:") throw new RpcError(-32602, "redirect_uri must be https");
+    }
+    const clientName = typeof body.client_name === "string" ? body.client_name.slice(0, 128) : "Dynamic client";
+    const runtime = oauthRuntime(env, request, deps);
+    const rand = crypto.getRandomValues(new Uint8Array(16));
+    const clientId = "dcr_" + Array.from(rand).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 24);
+    const secretBytes = crypto.getRandomValues(new Uint8Array(32));
+    const clientSecret = Array.from(secretBytes).map(b => b.toString(16).padStart(2, "0")).join("");
+    const secretHash = await sha256Hex(clientSecret);
+    await queryRun(runtime,
+      "INSERT INTO oauth_clients (client_id, client_secret_hash, redirect_uris, name, created_at) VALUES (?, ?, ?, ?, ?)",
+      [clientId, secretHash, JSON.stringify(redirectUris), clientName, nowIso(runtime)]);
+    return json({
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uris: redirectUris,
+      token_endpoint_auth_method: "client_secret_post",
+    });
+  } catch (err) {
+    return oauthFail(err);
+  }
 }
 
 async function handleOAuthToken(request, env, deps) {
@@ -2129,6 +2181,7 @@ export async function handleFetch(request, env, deps = {}) {
 
   if (path === "/oauth/authorize") return handleOAuthAuthorize(request, env, deps);
   if (path === "/oauth/token") return handleOAuthToken(request, env, deps);
+  if (path === "/oauth/register") return handleOAuthRegister(request, env, deps);
 
   const resource = resourceFromPath(path);
   if (resource) {
