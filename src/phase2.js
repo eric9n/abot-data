@@ -1129,12 +1129,16 @@ WHERE subscription_id = ? AND state IN ('due', 'inflight', 'paused')`,
     const left = new Date(nowMs - 7 * DAY_MS).toISOString();
     const rows = await queryAll(
       deps,
-      `SELECT id, title, start_utc, end_utc, timezone, all_day, location
-FROM calendar_events
-WHERE status = 'confirmed'
-  AND start_utc <= ?
-  AND start_utc >= ?
-ORDER BY start_utc ASC, id ASC
+      `SELECT ce.id, ce.title, ce.start_utc, ce.end_utc, ce.timezone, ce.all_day, ce.location
+FROM calendar_events ce
+WHERE ce.status = 'confirmed'
+  AND ce.start_utc <= ?
+  AND ce.start_utc >= ?
+  AND NOT EXISTS (
+    SELECT 1 FROM events e
+    WHERE e.dedupe_key = 'calendar.due:' || ce.id || ':' || ce.start_utc
+  )
+ORDER BY ce.start_utc ASC, ce.id ASC
 LIMIT ?`,
       [now, left, DETECT_LIMIT],
     );
