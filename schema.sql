@@ -166,11 +166,13 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
 );
 
 -- One-time authorization codes. code_hash is SHA-256 hex of the 32-byte code.
+-- code_challenge is the S256 PKCE challenge, or NULL when the client used only a secret.
 CREATE TABLE IF NOT EXISTS oauth_codes (
   code_hash TEXT PRIMARY KEY,
   client_id TEXT NOT NULL,
   redirect_uri TEXT NOT NULL,
   email TEXT NOT NULL,
   expires_at TEXT NOT NULL,
-  used_at TEXT
+  used_at TEXT,
+  code_challenge TEXT
 );

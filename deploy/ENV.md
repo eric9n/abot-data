@@ -15,7 +15,7 @@
 
 - Binding 名固定为 `DB`。
 - 表结构来自仓库根目录的 `schema.sql`，可重复执行：12 张表（`contacts`、`calendar_events`、`notes`、`events`、`subscriptions`、`deliveries`、`heartbeats`、`accounts`、`verification_codes`、`verification_requests`、`oauth_clients`、`oauth_codes`），17 个索引。
-- `oauth_clients.redirect_uris` 是 JSON 数组文本，回调地址按字符串精确匹配。`client_secret_hash` 和 `oauth_codes.code_hash` 都是 SHA-256 十六进制，明文不入库。客户端行由部署方写入，本仓库没有注册接口。
+- `oauth_clients.redirect_uris` 是 JSON 数组文本，回调地址按字符串精确匹配。`client_secret_hash` 和 `oauth_codes.code_hash` 都是 SHA-256 十六进制，明文不入库。`client_secret_hash` 为空字符串表示公开客户端（不校验 secret，授权必须带 S256 PKCE）。`oauth_codes.code_challenge` 可空，存的是 S256 challenge 原文。已经建好、还没有这一列的 `oauth_codes` 会在下一次签发授权码或换 token 时自动补上。客户端行由部署方写入，本仓库没有注册接口。
 - `contacts`、`calendar_events`、`notes` 有可空列 `owner_email`。新建库执行 `schema.sql` 即可，未写入该列的旧行保持 NULL。已经建好、还没有这一列的库要先补列（这三句只跑一次，`schema.sql` 本身不包含它们，因为重复执行 `ADD COLUMN` 会失败）：
 
 ```sql

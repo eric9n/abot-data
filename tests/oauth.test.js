@@ -56,10 +56,11 @@ function sha256(value) {
 }
 
 function insertClient(db, { clientId, secret, redirects, name }) {
+  const hash = secret == null ? "" : sha256(secret);
   db.prepare(
     `INSERT INTO oauth_clients (client_id, client_secret_hash, redirect_uris, name, created_at)
      VALUES (?, ?, ?, ?, ?)`,
-  ).run(clientId, sha256(secret), JSON.stringify(redirects), name, "2026-09-29T04:00:00.000Z");
+  ).run(clientId, hash, JSON.stringify(redirects), name, "2026-09-29T04:00:00.000Z");
 }
 
 function authorizeUrl(overrides = {}) {
@@ -70,8 +71,19 @@ function authorizeUrl(overrides = {}) {
     state: overrides.state ?? STATE,
   });
   if (overrides.scope) params.set("scope", overrides.scope);
+  if (Object.hasOwn(overrides, "code_challenge") && overrides.code_challenge != null) {
+    params.set("code_challenge", overrides.code_challenge);
+  }
+  if (Object.hasOwn(overrides, "code_challenge_method") && overrides.code_challenge_method != null) {
+    params.set("code_challenge_method", overrides.code_challenge_method);
+  }
   return `https://abot-data.test/oauth/authorize?${params}`;
 }
+
+// RFC 7636 appendix B.
+const VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+const PUBLIC_CLIENT = "muse";
 
 function mailFetch() {
   const sent = [];
@@ -174,6 +186,8 @@ test("oauth tables reapply and keep inserted clients", () => {
   assert.match(sql, /redirect_uris TEXT NOT NULL/);
   assert.match(sql, /CREATE TABLE IF NOT EXISTS oauth_codes \([\s\S]*code_hash TEXT PRIMARY KEY/);
   assert.match(sql, /used_at TEXT/);
+  assert.match(sql, /code_challenge TEXT/);
+  assert.equal(/\bcode_challenge TEXT NOT NULL\b/.test(sql), false);
   assert.equal(/\bdrop\s+table\b/i.test(sql), false);
   const db = new DatabaseSync(":memory:");
   db.exec(sql);
@@ -349,6 +363,7 @@ test("oauth authorization-code happy path returns the account token", async () =
   assert.match(code, /^[0-9a-f]{64}$/);
   assert.notEqual(code, emailCode);
   assert.equal(db.prepare("SELECT code_hash FROM oauth_codes").get().code_hash, sha256(code));
+  assert.equal(db.prepare("SELECT code_challenge FROM oauth_codes").get().code_challenge, null);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM verification_codes").get().n, 0);
 
   const token = await exchange(
@@ -396,4 +411,212 @@ test("oauth send reuses the verification rate limit", async () => {
 
   const later = await sendCode(env, "ada@example.com", { ip: "203.0.113.70", nowMs: NOW + HOUR + 1 });
   assert.equal(later.status, 200, later.html);
+});
+
+test("pkce test vector is the RFC 7636 S256 example", () => {
+  assert.equal(createHash("sha256").update(VERIFIER).digest("base64url"), CHALLENGE);
+});
+
+test("pkce S256 happy path issues a token without client_secret", async () => {
+  const { db, env } = sqliteEnv();
+  db.exec("ALTER TABLE oauth_codes DROP COLUMN code_challenge");
+  insertClient(db, { clientId: PUBLIC_CLIENT, secret: null, redirects: [REDIRECT], name: "Muse" });
+  assert.equal(db.prepare("SELECT name FROM pragma_table_info('oauth_codes') WHERE name = 'code_challenge'").get(), undefined);
+
+  const query = {
+    client_id: PUBLIC_CLIENT,
+    code_challenge: CHALLENGE,
+    code_challenge_method: "S256",
+  };
+  const page = await handleFetch(new Request(authorizeUrl(query)), env, { nowMs: NOW });
+  assert.equal(page.status, 200);
+  const pageHtml = await page.text();
+  assert.match(pageHtml, /code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM/);
+  assert.match(pageHtml, /code_challenge_method=S256/);
+
+  const sent = await sendCode(env, "Ada@Example.com", { ip: "203.0.113.80", query });
+  assert.equal(sent.status, 200, sent.html);
+  assert.match(sent.html, /code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM/);
+  assert.match(sent.html, /value="ada@example.com"/);
+  const emailCode = codeFromMail(sent.sent[0]);
+  assert.equal(sent.html.includes(emailCode), false);
+
+  const verified = await postAuthorize(
+    env,
+    { action: "verify", email: "ada@example.com", code: emailCode },
+    { ip: "203.0.113.80", query },
+  );
+  assert.equal(verified.status, 302, await verified.clone().text());
+  const location = new URL(verified.headers.get("location"));
+  assert.equal(`${location.origin}${location.pathname}`, REDIRECT);
+  assert.equal(location.searchParams.get("state"), STATE);
+  assert.equal(location.searchParams.get("code_challenge"), null);
+  const code = location.searchParams.get("code");
+  assert.match(code, /^[0-9a-f]{64}$/);
+  const stored = db.prepare("SELECT code_challenge, used_at, email FROM oauth_codes").get();
+  assert.equal(stored.code_challenge, CHALLENGE);
+  assert.equal(stored.used_at, null);
+  assert.equal(stored.email, "ada@example.com");
+  assert.equal(
+    db.prepare("SELECT name FROM pragma_table_info('oauth_codes') WHERE name = 'code_challenge'").get().name,
+    "code_challenge",
+  );
+
+  const token = await exchange(
+    env,
+    { code, redirect_uri: REDIRECT, client_id: PUBLIC_CLIENT, code_verifier: VERIFIER },
+    { form: true },
+  );
+  assert.equal(token.status, 200, JSON.stringify(token.body));
+  assert.deepEqual(Object.keys(token.body).sort(), ["access_token", "token_type"]);
+  assert.equal(token.body.token_type, "Bearer");
+  assert.match(token.body.access_token, /^ad_[0-9a-f]{32}$/);
+  const listed = await mcp(env, "list_contacts", {}, { token: token.body.access_token });
+  assert.equal(listed.status, 200);
+  assert.deepEqual(JSON.parse(listed.body.result.content[0].text), []);
+
+  const again = await exchange(env, {
+    code,
+    redirect_uri: REDIRECT,
+    client_id: PUBLIC_CLIENT,
+    code_verifier: VERIFIER,
+  });
+  assert.equal(again.status, 400);
+  assert.deepEqual(again.body.error, { code: -32602, message: "authorization code already used" });
+});
+
+test("pkce rejects a wrong or missing code_verifier without consuming the code", async () => {
+  const { db, env } = sqliteEnv();
+  insertClient(db, { clientId: PUBLIC_CLIENT, secret: null, redirects: [REDIRECT], name: "Muse" });
+  const query = {
+    client_id: PUBLIC_CLIENT,
+    code_challenge: CHALLENGE,
+    code_challenge_method: "S256",
+  };
+  const issued = await issueAuthCode(env, "ada@example.com", { ip: "203.0.113.81", query });
+
+  const wrong = await exchange(env, {
+    code: issued.code,
+    redirect_uri: REDIRECT,
+    client_id: PUBLIC_CLIENT,
+    code_verifier: `${VERIFIER.slice(0, -1)}a`,
+  });
+  assert.equal(wrong.status, 400);
+  assert.deepEqual(wrong.body.error, { code: -32602, message: "invalid code_verifier" });
+  assert.equal(db.prepare("SELECT used_at FROM oauth_codes").get().used_at, null);
+
+  const missing = await exchange(env, {
+    code: issued.code,
+    redirect_uri: REDIRECT,
+    client_id: PUBLIC_CLIENT,
+  });
+  assert.equal(missing.status, 400);
+  assert.deepEqual(missing.body.error, { code: -32602, message: "code_verifier is required" });
+  assert.equal(db.prepare("SELECT used_at FROM oauth_codes").get().used_at, null);
+
+  const short = await exchange(env, {
+    code: issued.code,
+    redirect_uri: REDIRECT,
+    client_id: PUBLIC_CLIENT,
+    code_verifier: "too-short",
+  });
+  assert.equal(short.status, 400);
+  assert.deepEqual(short.body.error, { code: -32602, message: "invalid code_verifier" });
+  assert.equal(db.prepare("SELECT used_at FROM oauth_codes").get().used_at, null);
+
+  const ok = await exchange(env, {
+    code: issued.code,
+    redirect_uri: REDIRECT,
+    client_id: PUBLIC_CLIENT,
+    code_verifier: VERIFIER,
+  });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+});
+
+test("authorize rejects a missing challenge or a non-S256 method", async () => {
+  const { db, env } = sqliteEnv();
+  insertClient(db, { clientId: PUBLIC_CLIENT, secret: null, redirects: [REDIRECT], name: "Muse" });
+  insertClient(db, { clientId: CLIENT, secret: SECRET, redirects: [REDIRECT], name: "Connector" });
+
+  const publicMissing = await readJson(await handleFetch(new Request(authorizeUrl({ client_id: PUBLIC_CLIENT })), env));
+  assert.equal(publicMissing.status, 400);
+  assert.deepEqual(publicMissing.body.error, { code: -32602, message: "code_challenge is required" });
+
+  const plain = await readJson(
+    await handleFetch(new Request(authorizeUrl({ code_challenge: CHALLENGE, code_challenge_method: "plain" })), env),
+  );
+  assert.equal(plain.status, 400);
+  assert.deepEqual(plain.body.error, { code: -32602, message: "code_challenge_method must be S256" });
+
+  const noMethod = await readJson(await handleFetch(new Request(authorizeUrl({ code_challenge: CHALLENGE })), env));
+  assert.equal(noMethod.status, 400);
+  assert.deepEqual(noMethod.body.error, { code: -32602, message: "code_challenge_method must be S256" });
+
+  const methodOnly = await readJson(await handleFetch(new Request(authorizeUrl({ code_challenge_method: "S256" })), env));
+  assert.equal(methodOnly.status, 400);
+  assert.deepEqual(methodOnly.body.error, { code: -32602, message: "code_challenge is required" });
+
+  const plainOnly = await readJson(await handleFetch(new Request(authorizeUrl({ code_challenge_method: "plain" })), env));
+  assert.equal(plainOnly.status, 400);
+  assert.deepEqual(plainOnly.body.error, { code: -32602, message: "code_challenge_method must be S256" });
+
+  const badChallenge = await readJson(
+    await handleFetch(new Request(authorizeUrl({ code_challenge: "not-a-challenge", code_challenge_method: "S256" })), env),
+  );
+  assert.equal(badChallenge.status, 400);
+  assert.deepEqual(badChallenge.body.error, { code: -32602, message: "code_challenge is invalid" });
+
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM oauth_codes").get().n, 0);
+  const secretPage = await handleFetch(new Request(authorizeUrl()), env);
+  assert.equal(secretPage.status, 200);
+});
+
+test("confidential client pkce still requires client_secret", async () => {
+  const { db, env } = sqliteEnv();
+  insertClient(db, { clientId: CLIENT, secret: SECRET, redirects: [REDIRECT], name: "Connector" });
+  const query = { code_challenge: CHALLENGE, code_challenge_method: "S256" };
+  const issued = await issueAuthCode(env, "ada@example.com", { ip: "203.0.113.82", query });
+  assert.equal(db.prepare("SELECT code_challenge FROM oauth_codes").get().code_challenge, CHALLENGE);
+
+  const noSecret = await exchange(env, {
+    code: issued.code,
+    redirect_uri: REDIRECT,
+    client_id: CLIENT,
+    code_verifier: VERIFIER,
+  });
+  assert.equal(noSecret.status, 400);
+  assert.deepEqual(noSecret.body.error, { code: -32602, message: "client_secret is required" });
+  assert.equal(db.prepare("SELECT used_at FROM oauth_codes").get().used_at, null);
+
+  const wrongSecret = await exchange(env, {
+    code: issued.code,
+    redirect_uri: REDIRECT,
+    client_id: CLIENT,
+    client_secret: "nope",
+    code_verifier: VERIFIER,
+  });
+  assert.equal(wrongSecret.status, 400);
+  assert.deepEqual(wrongSecret.body.error, { code: -32602, message: "invalid client_secret" });
+  assert.equal(db.prepare("SELECT used_at FROM oauth_codes").get().used_at, null);
+
+  const verifierWithoutSecretCheck = await exchange(env, {
+    code: issued.code,
+    redirect_uri: REDIRECT,
+    client_id: CLIENT,
+    client_secret: SECRET,
+    code_verifier: `${VERIFIER.slice(0, -1)}b`,
+  });
+  assert.equal(verifierWithoutSecretCheck.status, 400);
+  assert.deepEqual(verifierWithoutSecretCheck.body.error, { code: -32602, message: "invalid code_verifier" });
+  assert.equal(db.prepare("SELECT used_at FROM oauth_codes").get().used_at, null);
+
+  const ok = await exchange(env, {
+    code: issued.code,
+    redirect_uri: REDIRECT,
+    client_id: CLIENT,
+    client_secret: SECRET,
+    code_verifier: VERIFIER,
+  });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+  assert.match(ok.body.access_token, /^ad_[0-9a-f]{32}$/);
 });
