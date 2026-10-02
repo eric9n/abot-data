@@ -1123,6 +1123,48 @@ WHERE subscription_id = ? AND state IN ('due', 'inflight', 'paused')`,
     return { id, secret };
   }
 
+  async function buildCalendarDuePayload(row) {
+    return {
+      all_day: row.all_day === 1 || row.all_day === true,
+      calendar_event_id: row.id,
+      end_utc: row.end_utc || "",
+      location: row.location ?? null,
+      path: `/cal/${row.id}`,
+      start_utc: row.start_utc || "",
+      timezone: row.timezone || "",
+      title: row.title || "",
+    };
+  }
+
+  // Emit calendar.due for one event if not already emitted (any status).
+  // Returns true if emitted, false if skipped.
+  async function emitCalendarDueForEvent(deps, eventId, source) {
+    const nowMs = nowMsOf(deps);
+    const now = new Date(nowMs).toISOString();
+    const row = await queryFirst(
+      deps,
+      `SELECT ce.id, ce.title, ce.start_utc, ce.end_utc, ce.timezone, ce.all_day, ce.location
+FROM calendar_events ce
+WHERE ce.id = ?
+  AND ce.status = 'confirmed'
+  AND ce.start_utc <= ?
+  AND NOT EXISTS (
+    SELECT 1 FROM events e
+    WHERE e.dedupe_key = 'calendar.due:' || ce.id || ':' || ce.start_utc
+  )`,
+      [eventId, now],
+    );
+    if (!row) return false;
+    await insertBusEvent(deps, {
+      type: "calendar.due",
+      dedupeKey: `calendar.due:${row.id}:${row.start_utc}`,
+      payloadText: stableStringify(await buildCalendarDuePayload(row)),
+      notBefore: now,
+      source: source || "detector",
+    });
+    return true;
+  }
+
   async function detectCalendarDue(deps) {
     const nowMs = nowMsOf(deps);
     const now = new Date(nowMs).toISOString();
@@ -1143,23 +1185,7 @@ LIMIT ?`,
       [now, left, DETECT_LIMIT],
     );
     for (const row of rows) {
-      const payload = {
-        all_day: row.all_day === 1 || row.all_day === true,
-        calendar_event_id: row.id,
-        end_utc: row.end_utc || "",
-        location: row.location ?? null,
-        path: `/cal/${row.id}`,
-        start_utc: row.start_utc || "",
-        timezone: row.timezone || "",
-        title: row.title || "",
-      };
-      await insertBusEvent(deps, {
-        type: "calendar.due",
-        dedupeKey: `calendar.due:${row.id}:${row.start_utc}`,
-        payloadText: stableStringify(payload),
-        notBefore: now,
-        source: "detector",
-      });
+      await emitCalendarDueForEvent(deps, row.id);
     }
   }
 
@@ -1674,6 +1700,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
   return {
     tools,
     handlers,
+    emitCalendarDueForEvent,
     handleScheduled,
     handleQueue,
     consumeDelivery,
