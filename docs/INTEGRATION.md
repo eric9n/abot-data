@@ -13,10 +13,12 @@ Every agent gets its own account, identified by email. Data is isolated per
 account: you only see rows that belong to your email (plus system-level rows).
 
 There are two ways to get a token. Both end up with the same kind of token.
+OAuth is a generic standard — it is not Muse-specific. Any agent can use it.
 
-### Option A: OAuth 2.0 Authorization Code + PKCE (recommended)
+### Option A: OAuth 2.0 Authorization Code + PKCE (recommended for interactive clients)
 
-Standard OAuth 2.0 flow. Best for interactive clients that can open a browser.
+Standard OAuth 2.0 flow (RFC 6749 + RFC 7636). Best when your client can open
+a browser for the user.
 
 **Endpoints**
 
@@ -24,6 +26,36 @@ Standard OAuth 2.0 flow. Best for interactive clients that can open a browser.
 |---|---|
 | Authorize | `https://data.abot.run/oauth/authorize` |
 | Token | `https://data.abot.run/oauth/token` |
+| Dynamic client registration (RFC 7591) | `https://data.abot.run/oauth/register` |
+
+**Step 0 — Register your client (one time, optional)**
+
+If you don't have a pre-registered `client_id`, register dynamically:
+
+```http
+POST https://data.abot.run/oauth/register
+Content-Type: application/json
+
+{
+  "redirect_uris": ["https://your-app.example.com/oauth/callback"],
+  "client_name": "My Agent"
+}
+```
+
+Response:
+
+```json
+{
+  "client_id": "dcr_...",
+  "client_secret": "...",
+  "redirect_uris": ["https://your-app.example.com/oauth/callback"],
+  "token_endpoint_auth_method": "client_secret_post"
+}
+```
+
+Use the returned `client_id`/`client_secret` in the steps below. You can also
+skip registration and use any `client_id` string with PKCE (public client),
+but then `redirect_uri` must be pre-allowlisted.
 
 **Step 1 — Redirect the user to the authorize URL**
 
@@ -38,11 +70,10 @@ https://data.abot.run/oauth/authorize?
   &login_hint=<user-email>        # optional: pre-fills the email field
 ```
 
-- `client_id`: any string matching `[A-Za-z0-9._:-]{1,128}`. Public clients
-  (no secret) are accepted.
-- `redirect_uri`: must be an exact match of a registered URI, or the
-  allowlisted Muse callback
-  (`https://agent.meta.ai/api/hatch/oauth/callback`).
+- `client_id`: the ID from Step 0, or any string matching
+  `[A-Za-z0-9._:-]{1,128}` for public PKCE clients.
+- `redirect_uri`: must be an exact match of a URI registered in Step 0
+  (or a pre-allowlisted URI).
 - `login_hint`: optional. When present, the email field is pre-filled so the
   user only enters the verification code.
 
@@ -84,10 +115,10 @@ Response:
 - The access token is bound to the verified email. Re-issuing rotates it and
   invalidates the previous one.
 
-### Option B: Manual token via MCP tools (for programmatic agents)
+### Option B: Manual token via MCP tools (for headless/programmatic agents)
 
-If your agent cannot do a browser redirect, call these MCP tools directly
-(no Bearer token needed for these two):
+If your agent cannot open a browser (e.g. a background daemon or CLI), call
+these MCP tools directly (no Bearer token needed for these two):
 
 1. `request_account_verification` with `{"email": "..."}` — sends a 6-digit
    code to the email (rate-limited: 3/hour per email).
