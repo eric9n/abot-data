@@ -1879,10 +1879,22 @@ function redirectWithCode(redirectUri, state, code) {
   const target = new URL(redirectUri);
   target.searchParams.set("code", code);
   target.searchParams.set("state", state);
-  return new Response(null, {
+  const url = target.toString();
+  // Return an HTML page with JS redirect + manual fallback link.
+  // More compatible with in-app browsers than a bare 302.
+  const page = `<!DOCTYPE html><html><head><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<meta http-equiv="refresh" content="0;url=${escapeHtml(url)}">` +
+    `<title>\u6388\u6743\u6210\u529f</title></head><body>` +
+    `<p>\u6388\u6743\u6210\u529f\uFF0C\u6B63\u5728\u8FD4\u56DE Muse\u2026</p>` +
+    `<p><a href="${escapeHtml(url)}">\u5982\u679C\u6CA1\u6709\u81EA\u52A8\u8DF3\u8F6C\uFF0C\u8BF7\u70B9\u51FB\u8FD9\u91CC</a></p>` +
+    `<script>window.location.replace(${JSON.stringify(url)});</script>` +
+    `</body></html>`;
+  return new Response(page, {
     status: 302,
     headers: {
-      location: target.toString(),
+      location: url,
+      "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
     },
   });
