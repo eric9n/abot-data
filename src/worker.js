@@ -1301,7 +1301,7 @@ export const TOOLS = [
   {
     name: "request_account_verification",
     description:
-      "为邮箱申请 agent 账户验证码。无需 Bearer。同一邮箱 60 分钟最多 3 次，同一 IP 60 分钟最多 10 次。验证码 15 分钟有效，通过邮件发送。返回 {ok:true}，不包含验证码。已注册邮箱可以再次申请以轮换 token。",
+      "NEW AGENT START HERE (no Bearer needed): Step 1 of 2 to get your API token. Send a 6-digit verification code to an email address. Then call verify_account with the code to receive your Bearer token. Use that token as Authorization: Bearer header for all other tools. 为邮箱申请 agent 账户验证码。无需 Bearer。同一邮箱 60 分钟最多 3 次，同一 IP 60 分钟最多 10 次。验证码 15 分钟有效，通过邮件发送。返回 {ok:true}，不包含验证码。已注册邮箱可以再次申请以轮换 token。",
     inputSchema: {
       type: "object",
       properties: { email: { type: "string" } },
@@ -1312,7 +1312,7 @@ export const TOOLS = [
   {
     name: "verify_account",
     description:
-      "提交邮箱验证码。成功返回 {ok:true, token}。token 形如 ad_ 加 32 位十六进制，只出现这一次。已有账户会轮换 token，旧 token 立即失效。验证码错误会计入尝试次数，达到 5 次后拒绝。",
+      "NEW AGENT START HERE (no Bearer needed): Step 2 of 2 to get your API token. Submit the email + verification code from request_account_verification. Returns {ok:true, token}. Save the token and use it as Authorization: Bearer header for all other tools. 提交邮箱验证码。成功返回 {ok:true, token}。token 形如 ad_ 加 32 位十六进制，只出现这一次。已有账户会轮换 token，旧 token 立即失效。验证码错误会计入尝试次数，达到 5 次后拒绝。",
     inputSchema: {
       type: "object",
       properties: {
@@ -1506,6 +1506,8 @@ function clientIp(request, deps) {
 
 function isPublicAccountCall(message) {
   if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+  // Discovery methods are public so new agents can self-onboard without docs.
+  if (message.method === "initialize" || message.method === "tools/list") return true;
   if (message.method !== "tools/call") return false;
   const params = message.params;
   if (!params || typeof params !== "object" || Array.isArray(params)) return false;
