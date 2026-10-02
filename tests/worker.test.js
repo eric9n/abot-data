@@ -132,6 +132,13 @@ function rpcError(rpc) {
   return rpc.body.error;
 }
 
+test("the scheduler keeps one global object and says why it is not sharded by owner", () => {
+  const src = readFileSync(new URL("../src/scheduler.js", import.meta.url), "utf8");
+  assert.match(src, /idFromName\("global"\)/);
+  assert.match(src, /per-owner shard/i);
+  assert.match(src, /owner_email/);
+});
+
 test("idFromBytes uses the alphabet and skips biased bytes", () => {
   assert.equal(timingSafeEqual("abc", "abc"), true);
   assert.equal(timingSafeEqual("abc", "abd"), false);
@@ -741,6 +748,8 @@ test("phase 2 schema appends four tables and reapplies without dropping rows", (
   assert.match(sql, /CREATE TABLE IF NOT EXISTS subscriptions/);
   assert.match(sql, /CREATE TABLE IF NOT EXISTS deliveries/);
   assert.match(sql, /CREATE TABLE IF NOT EXISTS heartbeats/);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS event_claims/);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS write_quotas/);
   assert.match(sql, /^-- abot-data v1\. Safe to re-run\. Does not touch the mail archive\.\nCREATE TABLE/);
   assert.match(sql, /secret_sealed TEXT,\n  webhook_auth TEXT NOT NULL DEFAULT 'hmac',\n  watch_heartbeat/);
   assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_open/);

@@ -11,10 +11,12 @@
 
 `compatibility_date` 为 `2026-09-01`。
 
+Service Binding 是网关入口。请求带合法的 `X-Abot-Owner-Email` 时按该账户隔离，邮箱不合法则 401。`X-Internal-Token` 不参与鉴权。不带 owner 头时继续走 Bearer。
+
 ## D1
 
 - Binding 名固定为 `DB`。
-- 表结构来自仓库根目录的 `schema.sql`，可重复执行：12 张表（`contacts`、`calendar_events`、`notes`、`events`、`subscriptions`、`deliveries`、`heartbeats`、`accounts`、`verification_codes`、`verification_requests`、`oauth_clients`、`oauth_codes`），17 个索引。
+- 表结构来自仓库根目录的 `schema.sql`，可重复执行：14 张表（`contacts`、`calendar_events`、`notes`、`events`、`event_claims`、`write_quotas`、`subscriptions`、`deliveries`、`heartbeats`、`accounts`、`verification_codes`、`verification_requests`、`oauth_clients`、`oauth_codes`），17 个索引。`event_claims` 是系统事件的按账户租约，已经建好的库会在账户第一次 `poll_events` 或 `ack_event` 时补上。`write_quotas` 是鉴权后的写频率计数，第一次写操作时补上。
 - `oauth_clients.redirect_uris` 是 JSON 数组文本，回调地址按字符串精确匹配。`client_secret_hash` 和 `oauth_codes.code_hash` 都是 SHA-256 十六进制，明文不入库。`client_secret_hash` 为空字符串表示公开客户端（不校验 secret，授权必须带 S256 PKCE）。`oauth_codes.code_challenge` 可空，存的是 S256 challenge 原文。已经建好、还没有这一列的 `oauth_codes` 会在下一次签发授权码或换 token 时自动补上。客户端行由部署方写入，本仓库没有注册接口。
 - `contacts`、`calendar_events`、`notes` 有可空列 `owner_email`。新建库执行 `schema.sql` 即可，未写入该列的旧行保持 NULL。已经建好、还没有这一列的库要先补列（这三句只跑一次，`schema.sql` 本身不包含它们，因为重复执行 `ADD COLUMN` 会失败）：
 
@@ -63,8 +65,10 @@ Worker 用 batch 的 `queue` 名区分：`abot-deliver-dlq` 记死信，其余�
 
 生产 secrets 由部署方注入，绝不进仓库：
 
-- `DATA_MCP_TOKEN`：`POST /mcp` 与 canonical GET 的 legacy Bearer。它仍然能读写全部行，`owner_email` 写成 NULL。
+- `DATA_MCP_TOKEN`：`POST /mcp` 与 canonical GET 的 legacy Bearer。它仍然能读写联系人、日历和笔记的全部行，`owner_email` 写成 NULL。总线 poll 只看到系统事件（`owner_email` 为空），不能借此读到账户事件。
 - `SUBSCRIPTION_SEAL`：订阅 webhook secret 的封装密钥
 - `RESEND_API_KEY`：账户验证码邮件。Worker 只从该环境变量读取，值不进仓库、不进日志。发件人是 `abot-data@abot.run`。
+- `SCHEDULER_SECRET`：Durable Object 回调 `POST /internal/scheduler-due` 的 `X-Scheduler-Secret`。Worker 用恒定时间比较（`timingSafeEqual`）核对这个头。
+- `WRITE_RATE_LIMIT`：可选。鉴权后每个身份每 60 秒的写操作上限，默认 120。读操作不计数。身份是账户邮箱，legacy token 共用 `legacy`。
 
 本地密钥文件（`.prod-token`、`.kek_b64`、`.dev.vars`、`.env`、`.env.*`、`*.pem`、`*.key`）已列入 `.gitignore`。
