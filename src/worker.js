@@ -1766,6 +1766,29 @@ async function loadOAuthClient(deps, clientId) {
   return row;
 }
 
+// Unregistered public PKCE clients (e.g. Muse custom connector). The
+// redirect must match exactly; the email verification is the real auth.
+const PUBLIC_PKCE_REDIRECT_ALLOWLIST = ["https://agent.meta.ai/api/hatch/oauth/callback"];
+
+async function loadAuthorizeClient(deps, query) {
+  const row = await queryFirst(
+    deps,
+    "SELECT client_id, client_secret_hash, redirect_uris, name FROM oauth_clients WHERE client_id = ?",
+    [query.clientId],
+  );
+  if (row) return row;
+  if (!query.codeChallenge) throw new RpcError(-32602, "unknown client_id");
+  if (!PUBLIC_PKCE_REDIRECT_ALLOWLIST.includes(query.redirectUri)) {
+    throw new RpcError(-32602, "redirect_uri mismatch");
+  }
+  return {
+    client_id: query.clientId,
+    client_secret_hash: "",
+    redirect_uris: JSON.stringify(PUBLIC_PKCE_REDIRECT_ALLOWLIST),
+    name: "public-pkce",
+  };
+}
+
 function assertRegisteredRedirect(row, redirectUri) {
   let list;
   try {
@@ -1920,7 +1943,7 @@ async function handleOAuthAuthorize(request, env, deps) {
   try {
     const query = readOAuthQuery(new URL(request.url));
     const runtime = oauthRuntime(env, request, deps);
-    const client = await loadOAuthClient(runtime, query.clientId);
+    const client = await loadAuthorizeClient(runtime, query);
     assertRegisteredRedirect(client, query.redirectUri);
     if (!clientHasSecret(client) && !query.codeChallenge) {
       throw new RpcError(-32602, "code_challenge is required");
@@ -1988,8 +2011,14 @@ async function handleOAuthToken(request, env, deps) {
     if (!/^[0-9a-f]{64}$/.test(code)) throw new RpcError(-32602, "invalid authorization code");
     if (!/^[A-Za-z0-9._:-]{1,128}$/.test(clientId)) throw new RpcError(-32602, "client_id is invalid");
     const runtime = oauthRuntime(env, request, deps);
-    const client = await loadOAuthClient(runtime, clientId);
-    if (clientHasSecret(client)) {
+    let client = null;
+    try {
+      client = await loadOAuthClient(runtime, clientId);
+    } catch (err) {
+      // Unregistered public PKCE client: the code row must carry a challenge.
+      if (!err || err.code !== -32602) throw err;
+    }
+    if (client && clientHasSecret(client)) {
       if (clientSecret == null) throw new RpcError(-32602, "client_secret is required");
       await assertClientSecret(client, clientSecret);
     }
@@ -2013,7 +2042,7 @@ async function handleOAuthToken(request, env, deps) {
     const boundChallenge = typeof row.code_challenge === "string" && row.code_challenge.length > 0 ? row.code_challenge : null;
     if (boundChallenge) {
       await assertPkceVerifier(boundChallenge, codeVerifier);
-    } else if (!clientHasSecret(client)) {
+    } else if (!client || !clientHasSecret(client)) {
       throw new RpcError(-32602, "code_verifier is required");
     }
     const email = normalizeAccountEmail(row.email);
