@@ -744,6 +744,7 @@ test("phase 2 schema appends four tables and reapplies without dropping rows", (
   assert.match(sql, /^-- abot-data v1\. Safe to re-run\. Does not touch the mail archive\.\nCREATE TABLE/);
   assert.match(sql, /secret_sealed TEXT,\n  webhook_auth TEXT NOT NULL DEFAULT 'hmac',\n  watch_heartbeat/);
   assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_open/);
+  assert.match(sql, /ON events\(COALESCE\(owner_email, ''\), dedupe_key\) WHERE status = 'pending'/);
   const db = new DatabaseSync(":memory:");
   db.exec(sql);
   db.exec(sql);
@@ -1078,6 +1079,51 @@ test("audience defaults to bot, accepts user, rejects invalid values, and filter
   );
   assert.equal(again.created, true);
   assert.equal(db.prepare("SELECT audience FROM events WHERE id = ?").get(again.id).audience, "user");
+});
+
+test("event owner columns migrate idempotently and keep stored rows system-scoped", async () => {
+  const { db, env } = sqliteEnv();
+  db.exec("DROP INDEX IF EXISTS idx_events_dedupe_open");
+  db.exec("ALTER TABLE events DROP COLUMN owner_email");
+  db.exec("ALTER TABLE subscriptions DROP COLUMN owner_email");
+  db.exec("CREATE UNIQUE INDEX idx_events_dedupe_open ON events(dedupe_key) WHERE status = 'pending'");
+  db.prepare(
+    `INSERT INTO events (
+      id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at
+    ) VALUES ('evt_legacystock1', 'reminder.medication', '{}', 'pending', 'reminder.medication:stock', ?, ?, 'emit', ?)`,
+  ).run(NOW_ISO, NOW_ISO, NOW_ISO);
+  const created = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.followup",
+      dedupe_key: "reminder.followup:after-owner",
+    }),
+  );
+  assert.equal(created.created, true);
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = 'evt_legacystock1'").get().owner_email, null);
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(created.id).owner_email, null);
+  const again = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.followup",
+      dedupe_key: "reminder.followup:after-owner",
+    }),
+  );
+  assert.equal(again.created, false);
+  assert.equal(again.id, created.id);
+  const stockAgain = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:stock",
+    }),
+  );
+  assert.equal(stockAgain.created, false);
+  assert.equal(stockAgain.id, "evt_legacystock1");
+  assert.match(
+    db.prepare("SELECT sql FROM sqlite_master WHERE name = 'idx_events_dedupe_open'").get().sql,
+    /owner_email/,
+  );
+  const sub = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }));
+  assert.equal(db.prepare("SELECT owner_email FROM subscriptions WHERE id = ?").get(sub.id).owner_email, null);
+  unwrap(await mcp(env, "emit_event", { type: "reminder.medication", dedupe_key: "reminder.medication:second-pass" }));
 });
 
 test("payload with a secret key or whsec_ substring is not stored", async () => {

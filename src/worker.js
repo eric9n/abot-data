@@ -3,6 +3,7 @@
  * POST /mcp   MCP (Streamable HTTP, JSON-RPC)
  *   Bearer DATA_MCP_TOKEN: legacy access to every row
  *   Bearer ad_…: one agent account, rows scoped by owner_email
+ *   Bus poll for ad_ also returns system events (owner_email IS NULL)
  *   request_account_verification and verify_account: no Bearer
  * GET /ctc/{id}  GET /cal/{id}  GET /note/{id}   canonical JSON, same tokens
  * GET /health liveness, no personal data

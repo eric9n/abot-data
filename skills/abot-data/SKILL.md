@@ -24,7 +24,7 @@ abot-data 是 bot 的个人结构化数据层。MCP 只暴露数据。同步和�
 有两种 Bearer：
 
 - 部署方提供的 `DATA_MCP_TOKEN`：legacy 全量访问，行为与以前相同。
-- `verify_account` 返回的 `ad_` token：只属于一个邮箱。联系人、日历、笔记按 `owner_email` 隔离。事件总线（events、subscriptions、deliveries、heartbeats）不隔离。
+- `verify_account` 返回的 `ad_` token：只属于一个邮箱。联系人、日历、笔记按 `owner_email` 隔离，看不到别人的行，也看不到 legacy 的 NULL 行。事件上，这个 token 只能看到自己的事件和 `owner_email` 为空的系统事件；poll 只能用自己的订阅或系统订阅，别人的订阅与不存在一样。
 
 `request_account_verification` 和 `verify_account` 不需要 Bearer。不要把返回的 `ad_` token 写入仓库、日志或这个 skill。
 
@@ -133,7 +133,7 @@ Content-Type: application/json
 
 `emit_event` 必填。长度 1～200，字符集 `A-Za-z0-9:._-`。不能以 `watchdog.` 或 `calendar.due:` 开头。
 
-同一键仍有 pending 行时再次 emit，返回原 id，`created` 为 false，已存 payload 不变。ack 之后同一个键可以插入新事件。
+同一账户下，同一键仍有 pending 行时再次 emit，返回原 id，`created` 为 false，已存 payload 不变。ack 之后同一个键可以插入新事件。去重范围是 `(owner_email, dedupe_key)`：两个账户用同一个键各有一行；`owner_email` 为空的系统事件之间仍然互相去重。
 
 ### 事件命名
 
@@ -149,7 +149,7 @@ Content-Type: application/json
 
 **poll**
 
-1. `poll_events` 必填 `subscription_id`。可选 `cursor`、`limit`（默认 20）、`visibility_seconds`（默认 120 秒）、`audience`。
+1. `poll_events` 必填 `subscription_id`。可选 `cursor`、`limit`（默认 20）、`visibility_seconds`（默认 120 秒）、`audience`。账户 token 看不到其他账户的事件。系统事件（`owner_email` 为空）谁都能 poll 到。订阅若属于别的账户，返回 not found。
 2. 每条事件带 `lease_token`。租约期内其他 poll 看不到它。
 3. `cursor` 只翻页。不 ack 的事件在租约到期后还会再次出现。
 4. 处理完调用 `ack_event`，传入事件 `id` 和这次的 `lease_token`。

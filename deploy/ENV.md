@@ -23,6 +23,7 @@ ALTER TABLE contacts ADD COLUMN owner_email TEXT;
 ALTER TABLE calendar_events ADD COLUMN owner_email TEXT;
 ALTER TABLE notes ADD COLUMN owner_email TEXT;
 ```
+- `events` 和 `subscriptions` 也有可空列 `owner_email`。NULL 表示系统级。新建库执行 `schema.sql` 即可，未写入该列的旧行保持 NULL。已经建好的库不用手跑 ALTER：下次 `emit_event`、`poll_events`、`create_subscription` 或定时检测会补上这两列，并在需要时把 `idx_events_dedupe_open` 改成按 `COALESCE(owner_email, '')` 与 `dedupe_key` 去重。这两步可以重复执行。
 - `wrangler.toml` 里的 `database_id` 是占位符。生产库 id 由部署方注入，不写入仓库。
 
 ## Cron

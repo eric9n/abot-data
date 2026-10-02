@@ -75,10 +75,12 @@ CREATE TABLE IF NOT EXISTS events (
   poll_count INTEGER NOT NULL DEFAULT 0,
   source TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  audience TEXT NOT NULL DEFAULT 'bot' CHECK(audience IN ('bot','user'))
+  audience TEXT NOT NULL DEFAULT 'bot' CHECK(audience IN ('bot','user')),
+  owner_email TEXT
 );
+-- NULL owner_email is a system event. Pending dedupe is per owner, including NULL.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_open
-  ON events(dedupe_key) WHERE status = 'pending';
+  ON events(COALESCE(owner_email, ''), dedupe_key) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_events_poll
   ON events(status, not_before, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_events_type_created
@@ -95,7 +97,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   watch_heartbeat INTEGER NOT NULL DEFAULT 1,
   agent_id TEXT NOT NULL DEFAULT 'bot:main',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  owner_email TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_subs_status_mode
   ON subscriptions(status, mode);
