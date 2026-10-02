@@ -1633,6 +1633,11 @@ async function accountEmailForToken(env, token) {
 }
 
 async function resolveBearer(request, env) {
+  // 内部鉴权：网关透传，X-Internal-Token 有效则信任（网关已做对外鉴权）
+  const it = request.headers.get("x-internal-token") || "";
+  if (env.INTERNAL_TOKEN && it === env.INTERNAL_TOKEN) {
+    return { kind: "legacy" };
+  }
   const header = request.headers.get("authorization");
   if (bearerOk(header, env && env.DATA_MCP_TOKEN)) return { kind: "legacy" };
   const presented = bearerToken(header);
