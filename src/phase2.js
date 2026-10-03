@@ -505,6 +505,13 @@ export function createPhase2(api) {
     return caller != null && caller === subOwner;
   }
 
+  // System subscriptions are readable by every account. Only the legacy token may change them.
+  function subscriptionWritable(caller, subOwner) {
+    const system = subOwner == null || subOwner === "";
+    if (system) return caller == null;
+    return caller != null && caller === subOwner;
+  }
+
   function readNotBefore(value, nowMs) {
     if (value == null) return new Date(nowMs).toISOString();
     const iso = canonicalUtc(value, "not_before");
@@ -835,12 +842,17 @@ FROM subscriptions`;
     let won = [];
     if (matches.length) {
       if (!deps || typeof deps.batch !== "function") throw new Error("batch is not configured");
+      const leaseOwner = typeof owner === "string";
       const results = await deps.batch(
         matches.map((row, i) => ({
           sql: `UPDATE events
 SET leased_until = ?, lease_token = ?, poll_count = poll_count + 1, updated_at = ?
-WHERE id = ? AND status = 'pending' AND not_before <= ? AND (leased_until IS NULL OR leased_until <= ?)`,
-          params: [leasedUntil, tokens[i], now, row.id, now, now],
+WHERE id = ? AND status = 'pending' AND not_before <= ? AND (leased_until IS NULL OR leased_until <= ?)${
+            leaseOwner ? " AND (owner_email = ? OR owner_email IS NULL)" : ""
+          }`,
+          params: leaseOwner
+            ? [leasedUntil, tokens[i], now, row.id, now, now, owner]
+            : [leasedUntil, tokens[i], now, row.id, now, now],
         })),
       );
       for (let i = 0; i < matches.length; i++) {
@@ -887,15 +899,23 @@ WHERE id = ? AND status = 'pending' AND not_before <= ? AND (leased_until IS NUL
       throw new RpcError(-32602, "lease_token is required");
     }
     if (typeof args.lease_token !== "string") throw new RpcError(-32602, "lease_token is required");
+    await ensureEventOwnerIsolation(deps);
+    const owner = callerOwner(deps);
     const now = nowIso(deps);
     let changes = 0;
     if (LEASE_RE.test(args.lease_token)) {
+      const params = [now, now, id, args.lease_token];
+      let ownerSql = "";
+      if (typeof owner === "string") {
+        ownerSql = " AND (owner_email = ? OR owner_email IS NULL)";
+        params.push(owner);
+      }
       const result = await queryRun(
         deps,
         `UPDATE events
 SET status = 'acked', acked_at = ?, leased_until = NULL, lease_token = NULL, updated_at = ?
-WHERE id = ? AND status = 'pending' AND lease_token = ?`,
-        [now, now, id, args.lease_token],
+WHERE id = ? AND status = 'pending' AND lease_token = ?${ownerSql}`,
+        params,
       );
       changes = changesOf(result);
     }
@@ -903,8 +923,11 @@ WHERE id = ? AND status = 'pending' AND lease_token = ?`,
       const row = await queryFirst(deps, "SELECT id, created_at, status FROM events WHERE id = ?", [id]);
       return { id, status: "acked", idempotent: false, ack_cursor: encodeCursor(row.created_at, row.id) };
     }
-    const row = await queryFirst(deps, "SELECT id, status, created_at FROM events WHERE id = ?", [id]);
+    const row = await queryFirst(deps, "SELECT id, status, created_at, owner_email FROM events WHERE id = ?", [id]);
     if (!row) throw notFound();
+    if (typeof owner === "string" && row.owner_email != null && row.owner_email !== "" && row.owner_email !== owner) {
+      throw notFound();
+    }
     if (row.status === "acked") {
       return { id, status: "acked", idempotent: true, ack_cursor: encodeCursor(row.created_at, row.id) };
     }
@@ -1045,7 +1068,7 @@ LIMIT ?`,
     const id = requireId(args.id, "sub_");
     const existing = await queryFirst(deps, "SELECT id, mode, status, owner_email FROM subscriptions WHERE id = ?", [id]);
     if (!existing) throw notFound();
-    if (!subscriptionAllowed(callerOwner(deps), existing.owner_email)) throw notFound();
+    if (!subscriptionWritable(callerOwner(deps), existing.owner_email)) throw notFound();
     const sets = [];
     const params = [];
     if (has(args, "url")) {
@@ -1105,7 +1128,7 @@ WHERE subscription_id = ? AND state = 'paused'`,
     const id = requireId(args.id, "sub_");
     const existing = await queryFirst(deps, "SELECT id, owner_email FROM subscriptions WHERE id = ?", [id]);
     if (!existing) throw notFound();
-    if (!subscriptionAllowed(callerOwner(deps), existing.owner_email)) throw notFound();
+    if (!subscriptionWritable(callerOwner(deps), existing.owner_email)) throw notFound();
     const now = nowIso(deps);
     await queryRun(
       deps,
@@ -1124,7 +1147,7 @@ WHERE subscription_id = ? AND state IN ('due', 'inflight', 'paused')`,
     await ensureWebhookAuthColumn(deps);
     const existing = await queryFirst(deps, "SELECT id, mode, webhook_auth, owner_email FROM subscriptions WHERE id = ?", [id]);
     if (!existing) throw notFound();
-    if (!subscriptionAllowed(callerOwner(deps), existing.owner_email)) throw notFound();
+    if (!subscriptionWritable(callerOwner(deps), existing.owner_email)) throw notFound();
     if (existing.mode !== "webhook") throw new RpcError(-32602, "subscription has no webhook secret");
     const bearer = existing.webhook_auth === "bearer";
     if (bearer) {
@@ -1161,7 +1184,7 @@ WHERE subscription_id = ? AND state IN ('due', 'inflight', 'paused')`,
     const now = new Date(nowMs).toISOString();
     const row = await queryFirst(
       deps,
-      `SELECT ce.id, ce.title, ce.start_utc, ce.end_utc, ce.timezone, ce.all_day, ce.location
+      `SELECT ce.id, ce.title, ce.start_utc, ce.end_utc, ce.timezone, ce.all_day, ce.location, ce.owner_email
 FROM calendar_events ce
 WHERE ce.id = ?
   AND ce.status = 'confirmed'
@@ -1173,12 +1196,14 @@ WHERE ce.id = ?
       [eventId, now],
     );
     if (!row) return false;
+    const ownerEmail = row.owner_email == null || row.owner_email === "" ? null : row.owner_email;
     await insertBusEvent(deps, {
       type: "calendar.due",
       dedupeKey: `calendar.due:${row.id}:${row.start_utc}`,
       payloadText: stableStringify(await buildCalendarDuePayload(row)),
       notBefore: now,
       source: source || "detector",
+      ownerEmail,
     });
     return true;
   }

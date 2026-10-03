@@ -526,32 +526,7 @@ async function getContact(args, deps) {
     params,
   );
   if (!row) return { found: false, id };
-  const view = { found: true, ...contactView(row, deps.origin) };
-  // Link recent emails involving this contact's email address (same D1, no cross-service call)
-  if (row.email) {
-    try {
-      const emailRows = await queryAll(
-        deps,
-        `SELECT resend_id, direction, msg_from, subject, date
-         FROM emails
-         WHERE msg_from = ? OR msg_to LIKE ?
-         ORDER BY date DESC LIMIT 5`,
-        [row.email, `%"${row.email}"%`],
-      );
-      if (emailRows.length > 0) {
-        view.recent_emails = emailRows.map(e => ({
-          id: e.resend_id,
-          direction: e.direction,
-          from: e.msg_from,
-          subject: e.subject,
-          date: e.date,
-        }));
-      }
-    } catch {
-      // emails table may not exist in older deployments; ignore
-    }
-  }
-  return view;
+  return { found: true, ...contactView(row, deps.origin) };
 }
 
 async function listContacts(args, deps) {
