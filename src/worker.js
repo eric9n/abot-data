@@ -3,8 +3,7 @@
  * POST /mcp   MCP (Streamable HTTP, JSON-RPC)
  *   Bearer DATA_MCP_TOKEN: legacy access to every row
  *   Bearer ad_…: one agent account, rows scoped by owner_email
- *   X-Internal-Token: custom-domain gateway; must match INTERNAL_TOKEN
- *   omitted X-Internal-Token + X-Abot-Owner-Email: Service Binding, that account
+ *   X-Abot-Owner-Email: Service Binding gateway, scoped to that account
  *   Bus poll for ad_ also returns system events (owner_email IS NULL)
  *   request_account_verification and verify_account: no Bearer
  * GET /ctc/{id}  GET /cal/{id}  GET /note/{id}   canonical JSON, same tokens
@@ -1637,20 +1636,15 @@ async function accountEmailForToken(env, token) {
   return row && typeof row.email === "string" ? row.email : null;
 }
 
-function internalTokenMatches(env, presented) {
-  return !!(env && env.INTERNAL_TOKEN && timingSafeEqual(presented, env.INTERNAL_TOKEN));
-}
-
-// Valid X-Abot-Owner-Email scopes to that account. A missing header is the
-// legacy full-access path used by system callers that already proved the token.
-function gatewayOwnerIdentity(request) {
+// Service Bindings are the gateway entry. A present X-Abot-Owner-Email must
+// be a real address and scopes the call to that account. X-Internal-Token is
+// not consulted. No owner header falls through to Bearer / anonymous.
+function bindingOwnerIdentity(request) {
   const ownerHeader = request.headers.get("x-abot-owner-email");
-  if (ownerHeader != null && ownerHeader !== "") {
-    const email = normalizeAccountEmail(ownerHeader);
-    if (!email) return { kind: "unauthorized" };
-    return { kind: "account", email };
-  }
-  return { kind: "legacy" };
+  if (ownerHeader == null || ownerHeader === "") return null;
+  const email = normalizeAccountEmail(ownerHeader);
+  if (!email) return { kind: "unauthorized" };
+  return { kind: "account", email };
 }
 
 async function resolveExternalBearer(request, env) {
@@ -1672,28 +1666,8 @@ async function resolveExternalBearer(request, env) {
 }
 
 async function resolveBearer(request, env) {
-  // Canonical resource reads. A missing or wrong X-Internal-Token falls
-  // through to Bearer; only a matching token takes the gateway path.
-  const it = request.headers.get("x-internal-token") || "";
-  if (internalTokenMatches(env, it)) return gatewayOwnerIdentity(request);
-  return resolveExternalBearer(request, env);
-}
-
-async function resolveMcpIdentity(request, env) {
-  // Custom domain: a presented X-Internal-Token must match (timing-safe).
-  // Service Bindings omit the header. Those calls are trusted and must carry
-  // X-Abot-Owner-Email; without it, fall through to Bearer / anonymous.
-  const raw = request.headers.get("x-internal-token");
-  if (raw != null) {
-    if (!internalTokenMatches(env, raw)) return { kind: "unauthorized" };
-    return gatewayOwnerIdentity(request);
-  }
-  const ownerHeader = request.headers.get("x-abot-owner-email");
-  if (ownerHeader != null && ownerHeader !== "") {
-    const email = normalizeAccountEmail(ownerHeader);
-    if (!email) return { kind: "unauthorized" };
-    return { kind: "account", email };
-  }
+  const owner = bindingOwnerIdentity(request);
+  if (owner) return owner;
   return resolveExternalBearer(request, env);
 }
 
@@ -2369,7 +2343,7 @@ export async function handleFetch(request, env, deps = {}) {
 
   if (path === "/mcp") {
     if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
-    let identity = await resolveMcpIdentity(request, env);
+    let identity = await resolveBearer(request, env);
     if (identity.kind === "error") return json({ ok: false }, 500);
     if (identity.kind === "unauthorized") return unauthorizedMcp(request);
     let message = null;
