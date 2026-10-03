@@ -683,8 +683,9 @@ test("gateway internal header scopes requests to the bound account", async () =>
   const adaContact = unwrap(await mcp(env, "create_contact", { name: "Ada contact" }, { token: ada.token }));
   const beaContact = unwrap(await mcp(env, "create_contact", { name: "Bea contact" }, { token: bea.token }));
 
-  async function gwMcp(name, args, ownerEmail, internalToken = "internal-secret") {
-    const headers = { "content-type": "application/json", "x-internal-token": internalToken };
+  async function gwMcp(name, args, ownerEmail, internalToken = "internal-secret", extraHeaders = {}) {
+    const headers = { "content-type": "application/json", ...extraHeaders };
+    if (internalToken != null) headers["x-internal-token"] = internalToken;
     if (ownerEmail !== undefined) headers["x-abot-owner-email"] = ownerEmail;
     const res = await handleFetch(
       new Request("https://abot-data.test/mcp", {
@@ -708,7 +709,24 @@ test("gateway internal header scopes requests to the bound account", async () =>
   assert.equal((await gwMcp("list_contacts", {}, "not-an-email")).status, 401);
   // Wrong internal token is rejected
   assert.equal((await gwMcp("list_contacts", {}, "ada@example.com", "wrong")).status, 401);
+  // A presented token must pass even when a valid Bearer is also attached
+  assert.equal(
+    (await gwMcp("list_contacts", {}, "ada@example.com", "wrong", { authorization: `Bearer ${TOKEN}` })).status,
+    401,
+  );
   // No owner header: legacy full access (system/cron path)
   const allSeen = unwrap(await gwMcp("list_contacts", {}, undefined)).map((r) => r.id).sort();
   assert.deepEqual(allSeen, [adaContact.id, beaContact.id].sort());
+
+  // Service Binding: no X-Internal-Token, owner email is the account
+  const bound = unwrap(await gwMcp("create_contact", { name: "Bound" }, "ada@example.com", null));
+  assert.equal(unwrap(await gwMcp("get_contact", { id: bound.id }, "ada@example.com", null)).found, true);
+  assert.equal(unwrap(await gwMcp("get_contact", { id: bound.id }, "bea@example.com", null)).found, false);
+  const adaBound = unwrap(await gwMcp("list_contacts", {}, "ada@example.com", null)).map((r) => r.id);
+  assert.deepEqual(adaBound.sort(), [adaContact.id, bound.id].sort());
+  // Invalid owner email is rejected; a missing one is not a trusted binding
+  assert.equal((await gwMcp("list_contacts", {}, "not-an-email", null)).status, 401);
+  assert.equal((await gwMcp("list_contacts", {}, undefined, null)).status, 401);
+  // Empty token header counts as presented and must match
+  assert.equal((await gwMcp("list_contacts", {}, "ada@example.com", "")).status, 401);
 });

@@ -3,6 +3,8 @@
  * POST /mcp   MCP (Streamable HTTP, JSON-RPC)
  *   Bearer DATA_MCP_TOKEN: legacy access to every row
  *   Bearer ad_…: one agent account, rows scoped by owner_email
+ *   X-Internal-Token: custom-domain gateway; must match INTERNAL_TOKEN
+ *   omitted X-Internal-Token + X-Abot-Owner-Email: Service Binding, that account
  *   Bus poll for ad_ also returns system events (owner_email IS NULL)
  *   request_account_verification and verify_account: no Bearer
  * GET /ctc/{id}  GET /cal/{id}  GET /note/{id}   canonical JSON, same tokens
@@ -1635,20 +1637,23 @@ async function accountEmailForToken(env, token) {
   return row && typeof row.email === "string" ? row.email : null;
 }
 
-async function resolveBearer(request, env) {
-  // Internal auth: the gateway forwards after its own external auth.
-  // X-Internal-Token is checked timing-safe. When the gateway also passes
-  // X-Abot-Owner-Email, the request is scoped to that account (never legacy).
-  const it = request.headers.get("x-internal-token") || "";
-  if (env.INTERNAL_TOKEN && timingSafeEqual(it, env.INTERNAL_TOKEN)) {
-    const ownerHeader = request.headers.get("x-abot-owner-email");
-    if (ownerHeader != null && ownerHeader !== "") {
-      const email = normalizeAccountEmail(ownerHeader);
-      if (!email) return { kind: "unauthorized" };
-      return { kind: "account", email };
-    }
-    return { kind: "legacy" };
+function internalTokenMatches(env, presented) {
+  return !!(env && env.INTERNAL_TOKEN && timingSafeEqual(presented, env.INTERNAL_TOKEN));
+}
+
+// Valid X-Abot-Owner-Email scopes to that account. A missing header is the
+// legacy full-access path used by system callers that already proved the token.
+function gatewayOwnerIdentity(request) {
+  const ownerHeader = request.headers.get("x-abot-owner-email");
+  if (ownerHeader != null && ownerHeader !== "") {
+    const email = normalizeAccountEmail(ownerHeader);
+    if (!email) return { kind: "unauthorized" };
+    return { kind: "account", email };
   }
+  return { kind: "legacy" };
+}
+
+async function resolveExternalBearer(request, env) {
   const header = request.headers.get("authorization");
   if (bearerOk(header, env && env.DATA_MCP_TOKEN)) return { kind: "legacy" };
   const presented = bearerToken(header);
@@ -1664,6 +1669,32 @@ async function resolveBearer(request, env) {
   }
   if (header == null || String(header).trim() === "") return { kind: "anonymous" };
   return { kind: "unauthorized" };
+}
+
+async function resolveBearer(request, env) {
+  // Canonical resource reads. A missing or wrong X-Internal-Token falls
+  // through to Bearer; only a matching token takes the gateway path.
+  const it = request.headers.get("x-internal-token") || "";
+  if (internalTokenMatches(env, it)) return gatewayOwnerIdentity(request);
+  return resolveExternalBearer(request, env);
+}
+
+async function resolveMcpIdentity(request, env) {
+  // Custom domain: a presented X-Internal-Token must match (timing-safe).
+  // Service Bindings omit the header. Those calls are trusted and must carry
+  // X-Abot-Owner-Email; without it, fall through to Bearer / anonymous.
+  const raw = request.headers.get("x-internal-token");
+  if (raw != null) {
+    if (!internalTokenMatches(env, raw)) return { kind: "unauthorized" };
+    return gatewayOwnerIdentity(request);
+  }
+  const ownerHeader = request.headers.get("x-abot-owner-email");
+  if (ownerHeader != null && ownerHeader !== "") {
+    const email = normalizeAccountEmail(ownerHeader);
+    if (!email) return { kind: "unauthorized" };
+    return { kind: "account", email };
+  }
+  return resolveExternalBearer(request, env);
 }
 
 function attachIdentity(runtime, env, request, deps, identity) {
@@ -2338,7 +2369,7 @@ export async function handleFetch(request, env, deps = {}) {
 
   if (path === "/mcp") {
     if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
-    let identity = await resolveBearer(request, env);
+    let identity = await resolveMcpIdentity(request, env);
     if (identity.kind === "error") return json({ ok: false }, 500);
     if (identity.kind === "unauthorized") return unauthorizedMcp(request);
     let message = null;
