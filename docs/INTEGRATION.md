@@ -74,8 +74,10 @@ https://data.abot.run/oauth/authorize?
   `[A-Za-z0-9._:-]{1,128}` for public PKCE clients.
 - `redirect_uri`: must be an exact match of a URI registered in Step 0
   (or a pre-allowlisted URI).
-- `login_hint`: optional. When present, the email field is pre-filled so the
-  user only enters the verification code.
+- `login_hint`: optional. When present, the email field is pre-filled. The
+  page shows `client_id` and `redirect_uri` for the user to confirm. A GET
+  does not send a verification code and does not issue an authorization code;
+  the user submits the form to send the code.
 
 **Step 2 — User verifies email**
 

@@ -397,6 +397,26 @@ test("oauth authorization-code happy path returns the account token", async () =
   assert.equal(stillValid.status, 200, JSON.stringify(stillValid.body));
 });
 
+test("authorize shows the client and callback, and login_hint does not send a code", async () => {
+  const { db, env } = sqliteEnv();
+  insertClient(db, { clientId: CLIENT, secret: SECRET, redirects: [REDIRECT], name: "Connector" });
+  const { sent, fetchImpl } = mailFetch();
+  const url = `${authorizeUrl()}&login_hint=Ada@Example.com`;
+  const res = await handleFetch(new Request(url), env, { nowMs: NOW, fetch: fetchImpl });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("location"), null);
+  const html = await res.text();
+  assert.match(html, /<dt>客户端<\/dt>/);
+  assert.match(html, /<dt>回调地址<\/dt>/);
+  assert.match(html, new RegExp(`<code>${CLIENT}</code>`));
+  assert.match(html, new RegExp(`<code>${REDIRECT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}</code>`));
+  assert.match(html, /value="ada@example.com"/);
+  assert.doesNotMatch(html, /验证码已发送/);
+  assert.equal(sent.length, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM verification_codes").get().n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM oauth_codes").get().n, 0);
+});
+
 test("oauth send reuses the verification rate limit", async () => {
   const { db, env } = sqliteEnv();
   insertClient(db, { clientId: CLIENT, secret: SECRET, redirects: [REDIRECT], name: "Connector" });

@@ -501,15 +501,16 @@ export function createPhase2(api) {
   }
 
   function subscriptionAllowed(caller, subOwner) {
-    if (subOwner == null || subOwner === "") return true;
-    return caller != null && caller === subOwner;
+    const owned = subOwner == null || subOwner === "" ? null : subOwner;
+    // Exact match, including NULL. An ad_ account must not open a legacy
+    // subscription: that row is a bus bypass (list, retarget, delete, rotate, poll).
+    if (caller == null) return owned == null;
+    return owned === caller;
   }
 
-  // System subscriptions are readable by every account. Only the legacy token may change them.
-  function subscriptionWritable(caller, subOwner) {
-    const system = subOwner == null || subOwner === "";
-    if (system) return caller == null;
-    return caller != null && caller === subOwner;
+  function ownerBind(caller) {
+    if (caller == null) return { clause: "owner_email IS NULL", params: [] };
+    return { clause: "owner_email = ?", params: [caller] };
   }
 
   function readNotBefore(value, nowMs) {
@@ -600,11 +601,14 @@ export function createPhase2(api) {
 
   async function fanoutEvent(deps, event) {
     const ownerEmail = event.ownerEmail == null || event.ownerEmail === "" ? null : event.ownerEmail;
+    // Owned emits go only to that owner's webhooks. A NULL-owner webhook must
+    // not see them. System emits (NULL owner) still match every active webhook,
+    // which is the same set poll returns for an account plus the legacy subs.
     const subs = await queryAll(
       deps,
       `SELECT id, event_types FROM subscriptions
 WHERE status = 'active' AND mode = 'webhook'
-  AND (owner_email IS NULL OR owner_email = ? OR ? IS NULL)`,
+  AND (owner_email = ? OR (? IS NULL))`,
       [ownerEmail, ownerEmail],
     );
     const nowMs = Date.parse(event.now);
@@ -667,22 +671,70 @@ WHERE status = 'active' AND mode = 'webhook'
     throw new Error("id entropy exhausted");
   }
 
+  async function ensureEventClaims(deps) {
+    await queryRun(
+      deps,
+      `CREATE TABLE IF NOT EXISTS event_claims (
+        event_id TEXT NOT NULL,
+        owner_email TEXT NOT NULL,
+        lease_token TEXT,
+        leased_until TEXT,
+        poll_count INTEGER NOT NULL DEFAULT 0,
+        acked_at TEXT,
+        PRIMARY KEY (event_id, owner_email)
+      )`,
+      [],
+    );
+  }
+
   async function listVisible(deps, now, { after, beforeOrEqual, expiredLeaseOnly, limit, audience, owner }) {
-    const where = [
-      "status = 'pending'",
-      "not_before <= ?",
-      "(leased_until IS NULL OR leased_until <= ?)",
-    ];
-    const params = [now, now];
+    const where = ["status = 'pending'", "not_before <= ?"];
+    const params = [now];
     if (audience) {
       where.push("audience = ?");
       params.push(audience);
     }
     if (typeof owner === "string") {
-      where.push("(owner_email = ? OR owner_email IS NULL)");
-      params.push(owner);
+      // Own rows use the event lease. System rows use event_claims so one
+      // account cannot consume the lease for every other account.
+      where.push(`(
+        (owner_email = ? AND (leased_until IS NULL OR leased_until <= ?))
+        OR (
+          owner_email IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM event_claims c
+            WHERE c.event_id = events.id
+              AND c.owner_email = ?
+              AND (
+                c.acked_at IS NOT NULL
+                OR (c.leased_until IS NOT NULL AND c.leased_until > ?)
+              )
+          )
+        )
+      )`);
+      params.push(owner, now, owner, now);
+    } else {
+      where.push("owner_email IS NULL");
+      where.push("(leased_until IS NULL OR leased_until <= ?)");
+      params.push(now);
     }
-    if (expiredLeaseOnly) where.push("leased_until IS NOT NULL");
+    if (expiredLeaseOnly) {
+      if (typeof owner === "string") {
+        where.push(`(
+          (owner_email = ? AND leased_until IS NOT NULL)
+          OR (
+            owner_email IS NULL AND EXISTS (
+              SELECT 1 FROM event_claims c
+              WHERE c.event_id = events.id AND c.owner_email = ?
+                AND c.acked_at IS NULL AND c.leased_until IS NOT NULL
+            )
+          )
+        )`);
+        params.push(owner, owner);
+      } else {
+        where.push("leased_until IS NOT NULL");
+      }
+    }
     if (beforeOrEqual) {
       where.push("(created_at < ? OR (created_at = ? AND id <= ?))");
       params.push(beforeOrEqual.created_at, beforeOrEqual.created_at, beforeOrEqual.id);
@@ -694,7 +746,7 @@ WHERE status = 'active' AND mode = 'webhook'
     params.push(limit);
     return queryAll(
       deps,
-      `SELECT id, type, payload, dedupe_key, created_at, not_before, poll_count
+      `SELECT id, type, payload, dedupe_key, created_at, not_before, poll_count, owner_email
 FROM events
 WHERE ${where.join(" AND ")}
 ORDER BY created_at ASC, id ASC
@@ -746,23 +798,55 @@ LIMIT ?`,
   }
 
   async function retryAfterSeconds(deps, now, filters, audience, owner) {
-    const extra = [];
-    const params = [now, now];
-    if (audience) {
-      extra.push("audience = ?");
-      params.push(audience);
-    }
+    const rows = [];
     if (typeof owner === "string") {
-      extra.push("(owner_email = ? OR owner_email IS NULL)");
-      params.push(owner);
+      const ownedParams = [now, owner, now];
+      let ownedAud = "";
+      if (audience) {
+        ownedAud = " AND audience = ?";
+        ownedParams.push(audience);
+      }
+      rows.push(
+        ...(await queryAll(
+          deps,
+          `SELECT type, leased_until FROM events
+WHERE status = 'pending' AND not_before <= ? AND owner_email = ? AND leased_until IS NOT NULL AND leased_until > ?${ownedAud}`,
+          ownedParams,
+        )),
+      );
+      const claimParams = [now, owner, now];
+      let claimAud = "";
+      if (audience) {
+        claimAud = " AND e.audience = ?";
+        claimParams.push(audience);
+      }
+      rows.push(
+        ...(await queryAll(
+          deps,
+          `SELECT e.type AS type, c.leased_until AS leased_until
+FROM event_claims c
+JOIN events e ON e.id = c.event_id
+WHERE e.status = 'pending' AND e.not_before <= ? AND e.owner_email IS NULL
+  AND c.owner_email = ? AND c.acked_at IS NULL AND c.leased_until IS NOT NULL AND c.leased_until > ?${claimAud}`,
+          claimParams,
+        )),
+      );
+    } else {
+      const params = [now, now];
+      let extra = " AND owner_email IS NULL";
+      if (audience) {
+        extra += " AND audience = ?";
+        params.push(audience);
+      }
+      rows.push(
+        ...(await queryAll(
+          deps,
+          `SELECT type, leased_until FROM events
+WHERE status = 'pending' AND not_before <= ? AND leased_until IS NOT NULL AND leased_until > ?${extra}`,
+          params,
+        )),
+      );
     }
-    const extraSql = extra.length ? ` AND ${extra.join(" AND ")}` : "";
-    const rows = await queryAll(
-      deps,
-      `SELECT type, leased_until FROM events
-WHERE status = 'pending' AND not_before <= ? AND leased_until IS NOT NULL AND leased_until > ?${extraSql}`,
-      params,
-    );
     let best = null;
     for (const row of rows) {
       if (!eventTypeMatches(row.type, filters)) continue;
@@ -815,6 +899,7 @@ FROM subscriptions`;
     await ensureWebhookAuthColumn(deps);
     await ensureEventOwnerIsolation(deps);
     const owner = callerOwner(deps);
+    if (typeof owner === "string") await ensureEventClaims(deps);
     const sub = await queryFirst(
       deps,
       "SELECT id, mode, status, event_types, owner_email FROM subscriptions WHERE id = ?",
@@ -842,34 +927,63 @@ FROM subscriptions`;
     let won = [];
     if (matches.length) {
       if (!deps || typeof deps.batch !== "function") throw new Error("batch is not configured");
-      const leaseOwner = typeof owner === "string";
+      const account = typeof owner === "string";
       const results = await deps.batch(
-        matches.map((row, i) => ({
-          sql: `UPDATE events
+        matches.map((row, i) => {
+          const system = account && (row.owner_email == null || row.owner_email === "");
+          if (system) {
+            return {
+              sql: `INSERT INTO event_claims (event_id, owner_email, lease_token, leased_until, poll_count, acked_at)
+VALUES (?, ?, ?, ?, 1, NULL)
+ON CONFLICT(event_id, owner_email) DO UPDATE SET
+  lease_token = excluded.lease_token,
+  leased_until = excluded.leased_until,
+  poll_count = event_claims.poll_count + 1
+WHERE event_claims.acked_at IS NULL
+  AND (event_claims.leased_until IS NULL OR event_claims.leased_until <= ?)`,
+              params: [row.id, owner, tokens[i], leasedUntil, now],
+            };
+          }
+          const params = [leasedUntil, tokens[i], now, row.id, now, now];
+          const ownerSql = account ? "AND owner_email = ?" : "AND owner_email IS NULL";
+          if (account) params.push(owner);
+          return {
+            sql: `UPDATE events
 SET leased_until = ?, lease_token = ?, poll_count = poll_count + 1, updated_at = ?
-WHERE id = ? AND status = 'pending' AND not_before <= ? AND (leased_until IS NULL OR leased_until <= ?)${
-            leaseOwner ? " AND (owner_email = ? OR owner_email IS NULL)" : ""
-          }`,
-          params: leaseOwner
-            ? [leasedUntil, tokens[i], now, row.id, now, now, owner]
-            : [leasedUntil, tokens[i], now, row.id, now, now],
-        })),
+WHERE id = ? AND status = 'pending' AND not_before <= ? AND (leased_until IS NULL OR leased_until <= ?)
+${ownerSql}`,
+            params,
+          };
+        }),
       );
       for (let i = 0; i < matches.length; i++) {
         if (changesOf(results[i]) === 1) won.push({ row: matches[i], token: tokens[i] });
       }
     }
-    const events = won.map(({ row, token }) => ({
-      id: row.id,
-      type: row.type,
-      payload: JSON.parse(row.payload),
-      dedupe_key: row.dedupe_key,
-      created_at: row.created_at,
-      not_before: row.not_before,
-      lease_token: token,
-      leased_until: leasedUntil,
-      poll_count: Number(row.poll_count) + 1,
-    }));
+    const events = [];
+    for (const { row, token } of won) {
+      const system = typeof owner === "string" && (row.owner_email == null || row.owner_email === "");
+      let pollCount = Number(row.poll_count) + 1;
+      if (system) {
+        const claim = await queryFirst(
+          deps,
+          "SELECT poll_count FROM event_claims WHERE event_id = ? AND owner_email = ?",
+          [row.id, owner],
+        );
+        if (claim) pollCount = Number(claim.poll_count);
+      }
+      events.push({
+        id: row.id,
+        type: row.type,
+        payload: JSON.parse(row.payload),
+        dedupe_key: row.dedupe_key,
+        created_at: row.created_at,
+        not_before: row.not_before,
+        lease_token: token,
+        leased_until: leasedUntil,
+        poll_count: pollCount,
+      });
+    }
     let hasMore = false;
     if (hitScanCap) hasMore = true;
     else if (events.length === limit) {
@@ -900,37 +1014,56 @@ WHERE id = ? AND status = 'pending' AND not_before <= ? AND (leased_until IS NUL
     }
     if (typeof args.lease_token !== "string") throw new RpcError(-32602, "lease_token is required");
     await ensureEventOwnerIsolation(deps);
-    const owner = callerOwner(deps);
+    const caller = callerOwner(deps);
     const now = nowIso(deps);
+    const existing = await queryFirst(
+      deps,
+      "SELECT id, status, created_at, owner_email FROM events WHERE id = ?",
+      [id],
+    );
+    if (!existing) throw notFound();
+    const eventOwner = existing.owner_email == null || existing.owner_email === "" ? null : existing.owner_email;
+    if (caller == null) {
+      if (eventOwner != null) throw notFound();
+    } else if (eventOwner != null && eventOwner !== caller) {
+      throw notFound();
+    }
+    const cursor = encodeCursor(existing.created_at, existing.id);
+    if (caller != null && eventOwner == null) {
+      await ensureEventClaims(deps);
+      if (LEASE_RE.test(args.lease_token)) {
+        const result = await queryRun(
+          deps,
+          `UPDATE event_claims
+SET acked_at = ?, lease_token = NULL, leased_until = NULL
+WHERE event_id = ? AND owner_email = ? AND acked_at IS NULL AND lease_token = ?`,
+          [now, id, caller, args.lease_token],
+        );
+        if (changesOf(result) === 1) return { id, status: "acked", idempotent: false, ack_cursor: cursor };
+      }
+      const claim = await queryFirst(
+        deps,
+        "SELECT acked_at FROM event_claims WHERE event_id = ? AND owner_email = ?",
+        [id, caller],
+      );
+      if (claim && claim.acked_at) return { id, status: "acked", idempotent: true, ack_cursor: cursor };
+      throw new RpcError(-32602, "lease mismatch");
+    }
     let changes = 0;
     if (LEASE_RE.test(args.lease_token)) {
-      const params = [now, now, id, args.lease_token];
-      let ownerSql = "";
-      if (typeof owner === "string") {
-        ownerSql = " AND (owner_email = ? OR owner_email IS NULL)";
-        params.push(owner);
-      }
+      const bind = ownerBind(caller);
       const result = await queryRun(
         deps,
         `UPDATE events
 SET status = 'acked', acked_at = ?, leased_until = NULL, lease_token = NULL, updated_at = ?
-WHERE id = ? AND status = 'pending' AND lease_token = ?${ownerSql}`,
-        params,
+WHERE id = ? AND status = 'pending' AND lease_token = ? AND ${bind.clause}`,
+        [now, now, id, args.lease_token, ...bind.params],
       );
       changes = changesOf(result);
     }
-    if (changes === 1) {
-      const row = await queryFirst(deps, "SELECT id, created_at, status FROM events WHERE id = ?", [id]);
-      return { id, status: "acked", idempotent: false, ack_cursor: encodeCursor(row.created_at, row.id) };
-    }
-    const row = await queryFirst(deps, "SELECT id, status, created_at, owner_email FROM events WHERE id = ?", [id]);
-    if (!row) throw notFound();
-    if (typeof owner === "string" && row.owner_email != null && row.owner_email !== "" && row.owner_email !== owner) {
-      throw notFound();
-    }
-    if (row.status === "acked") {
-      return { id, status: "acked", idempotent: true, ack_cursor: encodeCursor(row.created_at, row.id) };
-    }
+    if (changes === 1) return { id, status: "acked", idempotent: false, ack_cursor: cursor };
+    const row = await queryFirst(deps, "SELECT status FROM events WHERE id = ?", [id]);
+    if (row && row.status === "acked") return { id, status: "acked", idempotent: true, ack_cursor: cursor };
     throw new RpcError(-32602, "lease mismatch");
   }
 
@@ -1042,13 +1175,12 @@ ON CONFLICT(agent_id) DO UPDATE SET
     const limit = clampLimit(args.limit, 20, 100);
     await ensureWebhookAuthColumn(deps);
     await ensureEventOwnerIsolation(deps);
-    // Account callers see their own subscriptions plus system (unowned) ones.
-    // Legacy callers see everything.
+    // Account callers see only their rows. A NULL-owner subscription is legacy-only.
     const owner = callerOwner(deps);
     const where = [];
     const params = [];
     if (owner != null) {
-      where.push("(owner_email = ? OR owner_email IS NULL)");
+      where.push("owner_email = ?");
       params.push(owner);
     }
     params.push(limit);
@@ -1068,7 +1200,7 @@ LIMIT ?`,
     const id = requireId(args.id, "sub_");
     const existing = await queryFirst(deps, "SELECT id, mode, status, owner_email FROM subscriptions WHERE id = ?", [id]);
     if (!existing) throw notFound();
-    if (!subscriptionWritable(callerOwner(deps), existing.owner_email)) throw notFound();
+    if (!subscriptionAllowed(callerOwner(deps), existing.owner_email)) throw notFound();
     const sets = [];
     const params = [];
     if (has(args, "url")) {
@@ -1100,9 +1232,15 @@ LIMIT ?`,
     if (sets.length === 0) throw new RpcError(-32602, "no fields to update");
     await ensureWebhookAuthColumn(deps);
     const now = nowIso(deps);
+    const bind = ownerBind(callerOwner(deps));
     sets.push("updated_at = ?");
-    params.push(now, id);
-    await queryRun(deps, `UPDATE subscriptions SET ${sets.join(", ")} WHERE id = ?`, params);
+    params.push(now, id, ...bind.params);
+    const updated = await queryRun(
+      deps,
+      `UPDATE subscriptions SET ${sets.join(", ")} WHERE id = ? AND ${bind.clause}`,
+      params,
+    );
+    if (changesOf(updated) !== 1) throw notFound();
     if (status === "paused") {
       await queryRun(
         deps,
@@ -1128,15 +1266,21 @@ WHERE subscription_id = ? AND state = 'paused'`,
     const id = requireId(args.id, "sub_");
     const existing = await queryFirst(deps, "SELECT id, owner_email FROM subscriptions WHERE id = ?", [id]);
     if (!existing) throw notFound();
-    if (!subscriptionWritable(callerOwner(deps), existing.owner_email)) throw notFound();
+    if (!subscriptionAllowed(callerOwner(deps), existing.owner_email)) throw notFound();
     const now = nowIso(deps);
+    const bind = ownerBind(callerOwner(deps));
+    const deleted = await queryRun(
+      deps,
+      `DELETE FROM subscriptions WHERE id = ? AND ${bind.clause}`,
+      [id, ...bind.params],
+    );
+    if (changesOf(deleted) !== 1) throw notFound();
     await queryRun(
       deps,
       `UPDATE deliveries SET state = 'dead', dead_reason = 'subscription_deleted', updated_at = ?
 WHERE subscription_id = ? AND state IN ('due', 'inflight', 'paused')`,
       [now, id],
     );
-    await queryRun(deps, "DELETE FROM subscriptions WHERE id = ?", [id]);
     return { id, deleted: true };
   }
 
@@ -1147,7 +1291,7 @@ WHERE subscription_id = ? AND state IN ('due', 'inflight', 'paused')`,
     await ensureWebhookAuthColumn(deps);
     const existing = await queryFirst(deps, "SELECT id, mode, webhook_auth, owner_email FROM subscriptions WHERE id = ?", [id]);
     if (!existing) throw notFound();
-    if (!subscriptionWritable(callerOwner(deps), existing.owner_email)) throw notFound();
+    if (!subscriptionAllowed(callerOwner(deps), existing.owner_email)) throw notFound();
     if (existing.mode !== "webhook") throw new RpcError(-32602, "subscription has no webhook secret");
     const bearer = existing.webhook_auth === "bearer";
     if (bearer) {
@@ -1159,7 +1303,13 @@ WHERE subscription_id = ? AND state IN ('due', 'inflight', 'paused')`,
     const secret = bearer ? assertBearerToken(args.bearer_token) : newWebhookSecret();
     const sealed = await sealSecret(secret, id, key);
     const now = nowIso(deps);
-    await queryRun(deps, "UPDATE subscriptions SET secret_sealed = ?, updated_at = ? WHERE id = ?", [sealed, now, id]);
+    const bind = ownerBind(callerOwner(deps));
+    const rotated = await queryRun(
+      deps,
+      `UPDATE subscriptions SET secret_sealed = ?, updated_at = ? WHERE id = ? AND ${bind.clause}`,
+      [sealed, now, id, ...bind.params],
+    );
+    if (changesOf(rotated) !== 1) throw notFound();
     if (bearer) return { id };
     return { id, secret };
   }
@@ -1182,6 +1332,7 @@ WHERE subscription_id = ? AND state IN ('due', 'inflight', 'paused')`,
   async function emitCalendarDueForEvent(deps, eventId, source) {
     const nowMs = nowMsOf(deps);
     const now = new Date(nowMs).toISOString();
+    await ensureEventOwnerIsolation(deps);
     const row = await queryFirst(
       deps,
       `SELECT ce.id, ce.title, ce.start_utc, ce.end_utc, ce.timezone, ce.all_day, ce.location, ce.owner_email
@@ -1192,6 +1343,7 @@ WHERE ce.id = ?
   AND NOT EXISTS (
     SELECT 1 FROM events e
     WHERE e.dedupe_key = 'calendar.due:' || ce.id || ':' || ce.start_utc
+      AND e.owner_email IS ce.owner_email
   )`,
       [eventId, now],
     );
@@ -1209,12 +1361,13 @@ WHERE ce.id = ?
   }
 
   async function detectCalendarDue(deps) {
+    await ensureEventOwnerIsolation(deps);
     const nowMs = nowMsOf(deps);
     const now = new Date(nowMs).toISOString();
     const left = new Date(nowMs - 7 * DAY_MS).toISOString();
     const rows = await queryAll(
       deps,
-      `SELECT ce.id, ce.title, ce.start_utc, ce.end_utc, ce.timezone, ce.all_day, ce.location
+      `SELECT ce.id
 FROM calendar_events ce
 WHERE ce.status = 'confirmed'
   AND ce.start_utc <= ?
@@ -1222,6 +1375,7 @@ WHERE ce.status = 'confirmed'
   AND NOT EXISTS (
     SELECT 1 FROM events e
     WHERE e.dedupe_key = 'calendar.due:' || ce.id || ':' || ce.start_utc
+      AND e.owner_email IS ce.owner_email
   )
 ORDER BY ce.start_utc ASC, ce.id ASC
 LIMIT ?`,
@@ -1590,7 +1744,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     {
       name: "poll_events",
       description:
-        "按订阅认领可见的 pending 事件。cursor 只翻页，不表示完成。返回 events、next_cursor、has_more、retry_after_seconds。传入 audience 时只返回该受众，不传则返回全部。账户 token 只返回自己的事件和系统事件；别人的订阅与不存在一样，返回 not found。",
+        "按订阅认领可见的 pending 事件。cursor 只翻页，不表示完成。返回 events、next_cursor、has_more、retry_after_seconds。传入 audience 时只返回该受众，不传则返回全部。账户 token 只返回自己的事件，外加还没被该账户认领的系统事件；系统事件按账户单独租约，不会被别人的 poll 抢走。别人的订阅、以及没有 owner 的系统订阅，与不存在一样，返回 not found。legacy token 只能 poll 系统订阅，并且只看到系统事件。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1665,7 +1819,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     },
     {
       name: "get_subscription",
-      description: "读取一条订阅。返回 webhook_auth，不含密钥。未找到是 not found。",
+      description: "读取一条订阅。返回 webhook_auth，不含密钥。只能读自己的订阅；别人的订阅和没有 owner 的系统订阅都是 not found。",
       inputSchema: {
         type: "object",
         properties: { id: { type: "string" } },
@@ -1675,7 +1829,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     },
     {
       name: "list_subscriptions",
-      description: "按 created_at、id 升序列出订阅。limit 默认 20，最大 100。返回 webhook_auth，不含密钥。",
+      description: "按 created_at、id 升序列出订阅。limit 默认 20，最大 100。返回 webhook_auth，不含密钥。账户 token 只列出自己的订阅，看不到别人的 webhook URL，也看不到没有 owner 的系统订阅。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1686,7 +1840,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     },
     {
       name: "update_subscription",
-      description: "更新订阅的 url、过滤器、status、心跳监视或 agent_id。不能改 mode。",
+      description: "更新自己的订阅的 url、过滤器、status、心跳监视或 agent_id。不能改 mode，也不能改别人的或系统订阅。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1703,7 +1857,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     },
     {
       name: "delete_subscription",
-      description: "硬删除订阅，并把未终态投递标成 dead，dead_reason 为 subscription_deleted。",
+      description: "硬删除自己的订阅，并把未终态投递标成 dead，dead_reason 为 subscription_deleted。别人的订阅和系统订阅是 not found。",
       inputSchema: {
         type: "object",
         properties: { id: { type: "string" } },
@@ -1714,7 +1868,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     {
       name: "rotate_subscription_secret",
       description:
-        "轮换 webhook 密钥。先看 webhook_auth：hmac 由服务端生成新 secret，只在这次响应里出现；bearer 必须传新的 bearer_token，且不回显。poll 订阅会拒绝。",
+        "轮换自己的 webhook 密钥。先看 webhook_auth：hmac 由服务端生成新 secret，只在这次响应里出现；bearer 必须传新的 bearer_token，且不回显。poll 订阅会拒绝。别人的订阅和系统订阅是 not found，不会换出新的 HMAC secret。",
       inputSchema: {
         type: "object",
         properties: {

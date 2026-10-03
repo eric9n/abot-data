@@ -7,6 +7,15 @@
  * the actual event emission using existing logic (dedupe, fanout, etc.).
  *
  * A per-minute cron sweep remains as a backfill safety net.
+ *
+ * Sharding: keep one object, idFromName("global"), rather than one DO per
+ * owner. The DO stores {calendarId -> dueTime} and posts that id back to the
+ * worker. The worker loads the calendar row and stamps calendar.due with that
+ * row's owner_email, so this object never fans titles, places, or times out
+ * to other tenants. A per-owner shard (idFromName(owner)) would cap one
+ * tenant's alarm backlog and storage, but schedule and cancel must both use
+ * the same name, and the cron sweep already backfills missed alarms. Revisit
+ * sharding only if one owner's due volume starts delaying other alarms.
  */
 
 export class Scheduler {

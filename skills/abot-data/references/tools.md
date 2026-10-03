@@ -124,7 +124,7 @@
 
 ### poll_events
 
-按订阅认领可见的 pending 事件。cursor 只翻页，不表示完成。返回 events、next_cursor、has_more、retry_after_seconds。传入 audience 时只返回该受众，不传则返回全部。账户 token 只返回自己的事件和系统事件；别人的订阅与不存在一样，返回 not found。
+按订阅认领可见的 pending 事件。cursor 只翻页，不表示完成。返回 events、next_cursor、has_more、retry_after_seconds。传入 audience 时只返回该受众，不传则返回全部。账户 token 只返回自己的事件和系统事件；系统事件按账户单独租约。别人的订阅、以及没有 owner 的系统订阅，与不存在一样，返回 not found。
 
 必填：`subscription_id`
 

@@ -4,12 +4,15 @@
  *   Bearer DATA_MCP_TOKEN: legacy access to every row
  *   Bearer ad_…: one agent account, rows scoped by owner_email
  *   X-Abot-Owner-Email: Service Binding gateway, scoped to that account
- *   Bus poll for ad_ also returns system events (owner_email IS NULL)
+ *   Bus poll for ad_ returns that account's events plus system events
+ *     (owner_email IS NULL). System events are leased per account.
+ *   A subscription with no owner is legacy-only. An ad_ token cannot use it.
  *   request_account_verification and verify_account: no Bearer
  * GET /ctc/{id}  GET /cal/{id}  GET /note/{id}   canonical JSON, same tokens
  * GET /health liveness, no personal data
- * GET  /oauth/authorize   authorization-code consent page (email code, optional PKCE S256)
- * POST /oauth/authorize   send or verify the email code, then 302
+ * GET  /oauth/authorize   consent page: shows client_id and redirect_uri.
+ *                         login_hint only prefills the email. It does not send a code.
+ * POST /oauth/authorize   user confirms: send or verify the email code, then 302
  * POST /oauth/token       exchange a one-time code for the ad_ token (secret and/or PKCE)
  * scheduled    detector and delivery repair (not a URL)
  * queue        abot-deliver / abot-deliver-dlq (not a URL)
@@ -36,6 +39,27 @@ const REPEAT_FREQ = new Set(["none", "daily", "weekly", "monthly"]);
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 const PUBLIC_ACCOUNT_TOOLS = new Set(["request_account_verification", "verify_account"]);
 const CODE_TTL_MS = 15 * 60 * 1000;
+const WRITE_WINDOW_MS = 60 * 1000;
+const DEFAULT_WRITE_LIMIT = 120;
+const WRITE_TOOLS = new Set([
+  "create_contact",
+  "update_contact",
+  "delete_contact",
+  "create_event",
+  "update_event",
+  "delete_event",
+  "create_note",
+  "update_note",
+  "delete_note",
+  "emit_event",
+  "create_subscription",
+  "update_subscription",
+  "delete_subscription",
+  "rotate_subscription_secret",
+  "poll_events",
+  "ack_event",
+  "heartbeat",
+]);
 const OAUTH_CODE_TTL_MS = 10 * 60 * 1000;
 const RATE_WINDOW_MS = 60 * 60 * 1000;
 const MAX_EMAIL_CODES = 3;
@@ -124,9 +148,12 @@ export function normalizeAccountEmail(value) {
   return email;
 }
 
+export function escapeLike(value) {
+  return String(value).replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
 export function likeContains(value) {
-  const escaped = String(value).replace(/[\\%_]/g, (ch) => `\\${ch}`);
-  return `%${escaped}%`;
+  return `%${escapeLike(value)}%`;
 }
 
 /**
@@ -626,6 +653,9 @@ async function schedulerDO(deps) {
   try {
     const ns = deps && deps.env && deps.env.SCHEDULER;
     if (!ns) return null;
+    // Single global DO on purpose. See Scheduler in scheduler.js: triggers are
+    // calendar ids, and emission reloads owner_email from D1. Per-owner shards
+    // are not used; one tenant's alarms are not a data-plane broadcast.
     return ns.get(ns.idFromName("global"));
   } catch {
     return null;
@@ -1405,10 +1435,56 @@ function toolText(value) {
   return { content: [{ type: "text", text: JSON.stringify(value) }] };
 }
 
+function writeRateLimit(deps) {
+  const raw = deps && deps.env && deps.env.WRITE_RATE_LIMIT;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (Number.isInteger(n) && n > 0) return n;
+  return DEFAULT_WRITE_LIMIT;
+}
+
+async function ensureWriteQuotaTable(deps) {
+  await queryRun(
+    deps,
+    `CREATE TABLE IF NOT EXISTS write_quotas (
+      owner_key TEXT PRIMARY KEY,
+      window_start INTEGER NOT NULL,
+      writes INTEGER NOT NULL
+    )`,
+    [],
+  );
+}
+
+/** Basic per-identity write cap after auth. Reads are not counted. */
+async function assertWriteRate(name, deps) {
+  if (!WRITE_TOOLS.has(name)) return;
+  if (!deps || (deps.authKind !== "legacy" && deps.authKind !== "account")) return;
+  const owner = scopedOwner(deps) || "legacy";
+  const limit = writeRateLimit(deps);
+  const now = nowMsOf(deps);
+  const windowStart = now - (now % WRITE_WINDOW_MS);
+  await ensureWriteQuotaTable(deps);
+  const row = await queryFirst(deps, "SELECT window_start, writes FROM write_quotas WHERE owner_key = ?", [owner]);
+  if (!row || Number(row.window_start) !== windowStart) {
+    await queryRun(
+      deps,
+      `INSERT INTO write_quotas (owner_key, window_start, writes) VALUES (?, ?, 1)
+       ON CONFLICT(owner_key) DO UPDATE SET window_start = excluded.window_start, writes = 1`,
+      [owner, windowStart],
+    );
+    return;
+  }
+  if (Number(row.writes) >= limit) throw new RpcError(-32602, "too many writes");
+  await queryRun(deps, "UPDATE write_quotas SET writes = writes + 1 WHERE owner_key = ? AND window_start = ?", [
+    owner,
+    windowStart,
+  ]);
+}
+
 async function callTool(name, args, deps) {
   if (deps && deps.authKind === "public" && !PUBLIC_ACCOUNT_TOOLS.has(name)) {
     throw new RpcError(-32601, `unknown tool: ${name}`);
   }
+  await assertWriteRate(name, deps);
   switch (name) {
     case "create_contact":
       return createContact(args, deps);
@@ -1952,7 +2028,13 @@ function renderAuthorizePage(query, view) {
 </head>
 <body>
   <h1>绑定邮箱</h1>
-  <p>验证通过后会回到连接方。</p>
+  <p>请确认要授权的客户端和回调地址。验证通过后才会回到连接方。</p>
+  <dl>
+    <dt>客户端</dt>
+    <dd><code>${escapeHtml(query.clientId)}</code></dd>
+    <dt>回调地址</dt>
+    <dd><code>${escapeHtml(query.redirectUri)}</code></dd>
+  </dl>
   ${error}
   ${sent}
   <form method="post" action="${escapeHtml(authorizeAction(query))}">
@@ -2096,19 +2178,9 @@ async function handleOAuthAuthorize(request, env, deps) {
       throw new RpcError(-32602, "code_challenge is required");
     }
     if (request.method === "GET") {
-      const hintEmail = query.loginHint || "";
-      // Auto-send verification code when login_hint is present: one-step flow.
-      if (hintEmail) {
-        try {
-          await requestAccountVerification({ email: hintEmail }, runtime);
-          return html(renderAuthorizePage(query, { email: hintEmail, sent: true }));
-        } catch (err) {
-          // Fall through to manual page on rate-limit etc.
-          const msg = err instanceof RpcError ? err.message : "internal error";
-          return html(renderAuthorizePage(query, { email: hintEmail, error: msg }), 400);
-        }
-      }
-      return html(renderAuthorizePage(query, { email: "" }));
+      // login_hint only prefills the form. Sending a code or issuing an
+      // authorization code requires the user to submit this confirmation page.
+      return html(renderAuthorizePage(query, { email: query.loginHint || "" }));
     }
     return postOAuthAuthorize(request, query, runtime);
   } catch (err) {

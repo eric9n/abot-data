@@ -86,6 +86,26 @@ CREATE INDEX IF NOT EXISTS idx_events_poll
 CREATE INDEX IF NOT EXISTS idx_events_type_created
   ON events(type, created_at);
 
+-- Per-owner lease for system events (owner_email IS NULL). Owned events keep
+-- events.leased_until. One account's poll must not hide a system event from
+-- another account, and acking it must not ack it for everyone.
+CREATE TABLE IF NOT EXISTS event_claims (
+  event_id TEXT NOT NULL,
+  owner_email TEXT NOT NULL,
+  lease_token TEXT,
+  leased_until TEXT,
+  poll_count INTEGER NOT NULL DEFAULT 0,
+  acked_at TEXT,
+  PRIMARY KEY (event_id, owner_email)
+);
+
+-- Authenticated write quota. One row per account email, or "legacy".
+CREATE TABLE IF NOT EXISTS write_quotas (
+  owner_key TEXT PRIMARY KEY,
+  window_start INTEGER NOT NULL,
+  writes INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS subscriptions (
   id TEXT PRIMARY KEY,
   mode TEXT NOT NULL,
