@@ -3,6 +3,7 @@
  * POST /mcp   MCP (Streamable HTTP, JSON-RPC)
  *   Bearer DATA_MCP_TOKEN: legacy access to every row
  *   Bearer ad_…: one agent account, rows scoped by owner_email
+ *   X-Abot-Owner-Email: Service Binding gateway, scoped to that account
  *   Bus poll for ad_ also returns system events (owner_email IS NULL)
  *   request_account_verification and verify_account: no Bearer
  * GET /ctc/{id}  GET /cal/{id}  GET /note/{id}   canonical JSON, same tokens
@@ -1635,20 +1636,18 @@ async function accountEmailForToken(env, token) {
   return row && typeof row.email === "string" ? row.email : null;
 }
 
-async function resolveBearer(request, env) {
-  // Internal auth: the gateway forwards after its own external auth.
-  // X-Internal-Token is checked timing-safe. When the gateway also passes
-  // X-Abot-Owner-Email, the request is scoped to that account (never legacy).
-  const it = request.headers.get("x-internal-token") || "";
-  if (env.INTERNAL_TOKEN && timingSafeEqual(it, env.INTERNAL_TOKEN)) {
-    const ownerHeader = request.headers.get("x-abot-owner-email");
-    if (ownerHeader != null && ownerHeader !== "") {
-      const email = normalizeAccountEmail(ownerHeader);
-      if (!email) return { kind: "unauthorized" };
-      return { kind: "account", email };
-    }
-    return { kind: "legacy" };
-  }
+// Service Bindings are the gateway entry. A present X-Abot-Owner-Email must
+// be a real address and scopes the call to that account. X-Internal-Token is
+// not consulted. No owner header falls through to Bearer / anonymous.
+function bindingOwnerIdentity(request) {
+  const ownerHeader = request.headers.get("x-abot-owner-email");
+  if (ownerHeader == null || ownerHeader === "") return null;
+  const email = normalizeAccountEmail(ownerHeader);
+  if (!email) return { kind: "unauthorized" };
+  return { kind: "account", email };
+}
+
+async function resolveExternalBearer(request, env) {
   const header = request.headers.get("authorization");
   if (bearerOk(header, env && env.DATA_MCP_TOKEN)) return { kind: "legacy" };
   const presented = bearerToken(header);
@@ -1664,6 +1663,12 @@ async function resolveBearer(request, env) {
   }
   if (header == null || String(header).trim() === "") return { kind: "anonymous" };
   return { kind: "unauthorized" };
+}
+
+async function resolveBearer(request, env) {
+  const owner = bindingOwnerIdentity(request);
+  if (owner) return owner;
+  return resolveExternalBearer(request, env);
 }
 
 function attachIdentity(runtime, env, request, deps, identity) {
