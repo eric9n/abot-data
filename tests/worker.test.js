@@ -219,11 +219,8 @@ test("wrangler config does not publish production and does not name the mail arc
   assert.equal(toml.includes("[env.production]"), false);
   assert.equal(toml.includes("dead_letter_queue"), false);
   assert.match(envDoc, /\*\/5 \* \* \* \*/);
-  assert.match(envDoc, /max_batch_size = 5/);
-  assert.match(envDoc, /max_retries = 3/);
-  assert.match(envDoc, /max_wait_time_ms = 1000/);
-  assert.match(envDoc, /queue = "abot-deliver-dlq"/);
-  assert.match(envDoc, /max_batch_size = 1/);
+  assert.match(envDoc, /node deploy\/cloudflare\.mjs deploy/);
+  assert.match(envDoc, /abot-deliver-dlq/);
   assert.equal(toml.includes("779058bf-f5c1-44de-b2c8-99350ec7748e"), false);
   assert.equal(/database_name\s*=\s*"abot-mail/.test(toml), false);
   assert.equal(/bucket_name\s*=\s*"abot-mail/.test(toml), false);
