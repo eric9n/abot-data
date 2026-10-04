@@ -312,7 +312,10 @@ test("oauth codes reject misuse, expiry, and reuse", async () => {
   assert.equal(again.status, 400);
   assert.deepEqual(again.body.error, { code: -32602, message: "authorization code already used" });
   assert.ok(db.prepare("SELECT used_at FROM oauth_codes WHERE email = 'bea@example.com'").get().used_at);
-  assert.equal(db.prepare("SELECT token_hash FROM accounts WHERE email = 'bea@example.com'").get().token_hash, sha256(ok.body.access_token));
+  assert.equal(
+    db.prepare("SELECT token_hash FROM account_tokens WHERE email = 'bea@example.com' AND client_id = ?").get(CLIENT).token_hash,
+    sha256(ok.body.access_token),
+  );
 });
 
 test("oauth authorization-code happy path returns the account token", async () => {
@@ -378,16 +381,29 @@ test("oauth authorization-code happy path returns the account token", async () =
   assert.match(token.body.access_token, /^ad_[0-9a-f]{32}$/);
   assert.notEqual(token.body.access_token, previousToken);
   assert.equal(
-    db.prepare("SELECT token_hash FROM accounts WHERE email = 'ada@example.com'").get().token_hash,
+    db.prepare("SELECT token_hash FROM account_tokens WHERE email = 'ada@example.com' AND client_id = ?").get(CLIENT).token_hash,
     sha256(token.body.access_token),
   );
   assert.ok(db.prepare("SELECT used_at FROM oauth_codes").get().used_at);
 
-  const stale = await mcp(env, "list_contacts", {}, { token: previousToken, nowMs: NOW + 1000 });
-  assert.equal(stale.status, 401);
+  const mainStill = await mcp(env, "list_contacts", {}, { token: previousToken, nowMs: NOW + 1000 });
+  assert.equal(mainStill.status, 200);
   const listed = await mcp(env, "list_contacts", {}, { token: token.body.access_token, nowMs: NOW + 1000 });
   assert.equal(listed.status, 200);
   assert.deepEqual(JSON.parse(listed.body.result.content[0].text), []);
+
+  const reauth = await issueAuthCode(env, "ada@example.com", { ip: "203.0.113.62", nowMs: NOW + 1500 });
+  const rotated = await exchange(
+    env,
+    { code: reauth.code, redirect_uri: REDIRECT, client_id: CLIENT, client_secret: SECRET },
+    { nowMs: NOW + 1500 },
+  );
+  assert.equal(rotated.status, 200);
+  const oldClient = await mcp(env, "list_contacts", {}, { token: token.body.access_token, nowMs: NOW + 1500 });
+  assert.equal(oldClient.status, 401);
+  const newClient = await mcp(env, "list_contacts", {}, { token: rotated.body.access_token, nowMs: NOW + 1500 });
+  assert.equal(newClient.status, 200);
+  assert.equal((await mcp(env, "list_contacts", {}, { token: previousToken, nowMs: NOW + 1500 })).status, 200);
 
   const justBefore = await issueAuthCode(env, "bea@example.com", { ip: "203.0.113.61", nowMs: NOW + 2000 });
   const stillValid = await exchange(

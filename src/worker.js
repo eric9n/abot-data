@@ -1173,6 +1173,49 @@ async function issueAccountToken(deps, email) {
   return token;
 }
 
+async function ensureAccountTokens(deps) {
+  await queryRun(
+    deps,
+    `CREATE TABLE IF NOT EXISTS account_tokens (
+      token_hash TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`,
+    [],
+  );
+  await queryRun(
+    deps,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_account_tokens_client ON account_tokens(email, client_id)",
+    [],
+  );
+}
+
+/**
+ * One token per (email, OAuth client). Re-authorizing a client rotates only
+ * that client's token, so connecting a second connector or calling
+ * verify_account does not log the others out.
+ */
+async function issueClientToken(deps, email, clientId) {
+  const now = nowIso(deps);
+  const placeholder = await sha256Hex(newAccountToken());
+  await queryRun(
+    deps,
+    `INSERT INTO accounts (email, token_hash, created_at, verified_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(email) DO UPDATE SET verified_at = excluded.verified_at`,
+    [email, placeholder, now, now],
+  );
+  await ensureAccountTokens(deps);
+  const token = newAccountToken();
+  await queryRun(
+    deps,
+    `INSERT INTO account_tokens (token_hash, email, client_id, created_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(email, client_id) DO UPDATE SET token_hash = excluded.token_hash, created_at = excluded.created_at`,
+    [await sha256Hex(token), email, clientId, now],
+  );
+  return token;
+}
+
 async function verifyAccount(args, deps) {
   requireArgs(args);
   assertOnlyKeys(args, new Set(["email", "code"]));
@@ -1717,8 +1760,16 @@ async function readPublicAccountCall(request) {
 
 async function accountEmailForToken(env, token) {
   const hash = await sha256Hex(token);
-  const row = await d1Deps(env).queryFirst("SELECT email FROM accounts WHERE token_hash = ?", [hash]);
-  return row && typeof row.email === "string" ? row.email : null;
+  const db = d1Deps(env);
+  const row = await db.queryFirst("SELECT email FROM accounts WHERE token_hash = ?", [hash]);
+  if (row && typeof row.email === "string") return row.email;
+  let client = null;
+  try {
+    client = await db.queryFirst("SELECT email FROM account_tokens WHERE token_hash = ?", [hash]);
+  } catch (err) {
+    if (!/no such table/i.test(String(err && err.message))) throw err;
+  }
+  return client && typeof client.email === "string" ? client.email : null;
 }
 
 /**
@@ -2443,7 +2494,7 @@ async function handleOAuthToken(request, env, deps) {
       [nowIso(runtime), codeHash],
     );
     if (changesOf(consumed) !== 1) throw new RpcError(-32602, "authorization code already used");
-    const token = await issueAccountToken(runtime, email);
+    const token = await issueClientToken(runtime, email, clientId);
     return json({ access_token: token, token_type: "Bearer" });
   } catch (err) {
     return oauthFail(err);

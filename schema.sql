@@ -170,6 +170,16 @@ CREATE TABLE IF NOT EXISTS accounts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_token_hash ON accounts(token_hash);
 
+-- OAuth access tokens, one per (email, client). accounts.token_hash is the
+-- token from verify_account; the two rotate independently.
+CREATE TABLE IF NOT EXISTS account_tokens (
+  token_hash TEXT PRIMARY KEY,
+  email TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_account_tokens_client ON account_tokens(email, client_id);
+
 CREATE TABLE IF NOT EXISTS verification_codes (
   email TEXT PRIMARY KEY,
   code_hash TEXT NOT NULL,
