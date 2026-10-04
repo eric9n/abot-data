@@ -641,6 +641,8 @@ async function emitRuleEvent(deps, type, entityIdField, entityId) {
       type,
       at: new Date().toISOString(),
       source: "abot-data",
+      // The row's owner_email: an account email, or null for legacy rows.
+      owner_email: scopedOwner(deps),
       [entityIdField]: entityId,
     });
   } catch (e) {

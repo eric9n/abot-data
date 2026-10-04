@@ -1087,3 +1087,16 @@ test("an account token can only request and verify a code for its own email", as
   const own = await requestCode(env, "ada@example.com", { ip: "203.0.113.172", token: ada.token });
   assert.deepEqual(unwrap(own.rpc), { ok: true });
 });
+
+test("rule events carry the owner of the changed row", async () => {
+  const { env } = sqliteEnv();
+  const ada = await register(env, "ada@example.com", { ip: "203.0.113.190" });
+  const sent = [];
+  env.RULE_EVENTS = { async send(body) { sent.push(body); } };
+  const note = unwrap(await mcp(env, "create_note", { title: "mine" }, { token: ada.token }));
+  unwrap(await mcp(env, "create_note", { title: "legacy" }));
+  assert.deepEqual(
+    sent.map((m) => [m.type, m.owner_email, m.note_id === note.id]),
+    [["note.created", "ada@example.com", true], ["note.created", null, false]],
+  );
+});
