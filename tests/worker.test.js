@@ -1087,7 +1087,7 @@ test("audience defaults to bot, accepts user, rejects invalid values, and filter
   assert.equal(db.prepare("SELECT audience FROM events WHERE id = ?").get(again.id).audience, "user");
 });
 
-test("event owner columns migrate idempotently and keep stored rows system-scoped", async () => {
+test("event owner columns migrate idempotently, keep stored rows system-scoped, and own new legacy emits", async () => {
   const { db, env } = sqliteEnv();
   db.exec("DROP INDEX IF EXISTS idx_events_dedupe_open");
   db.exec("ALTER TABLE events DROP COLUMN owner_email");
@@ -1106,7 +1106,7 @@ test("event owner columns migrate idempotently and keep stored rows system-scope
   );
   assert.equal(created.created, true);
   assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = 'evt_legacystock1'").get().owner_email, null);
-  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(created.id).owner_email, null);
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(created.id).owner_email, "legacy");
   const again = unwrap(
     await mcp(env, "emit_event", {
       type: "reminder.followup",

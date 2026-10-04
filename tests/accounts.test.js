@@ -585,7 +585,7 @@ test("event bus isolates owners, system events, and dedupe keys", async () => {
   assert.equal(legacyAgain.id, legacyEv.id);
   assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(adaEv.id).owner_email, "ada@example.com");
   assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(beaEv.id).owner_email, "bea@example.com");
-  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(legacyEv.id).owner_email, null);
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(legacyEv.id).owner_email, "legacy");
   assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = 'evt_stocklegacy1'").get().owner_email, null);
   assert.equal(JSON.parse(db.prepare("SELECT payload FROM events WHERE id = ?").get(adaEv.id).payload).who, "ada");
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE dedupe_key = ?").get(shared).n, 3);
@@ -594,8 +594,12 @@ test("event bus isolates owners, system events, and dedupe keys", async () => {
     return db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE subscription_id = ?").get(id).n;
   }
   assert.equal(deliveryCount(legacyHook.id), 1);
-  assert.equal(deliveryCount(adaHook.id), 2);
-  assert.equal(deliveryCount(beaHook.id), 2);
+  assert.equal(deliveryCount(adaHook.id), 1);
+  assert.equal(deliveryCount(beaHook.id), 1);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE event_id = ? AND subscription_id = ?").get(legacyEv.id, adaHook.id).n,
+    0,
+  );
   assert.equal(
     db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE event_id = ? AND subscription_id = ?").get(beaEv.id, adaHook.id).n,
     0,
@@ -611,14 +615,14 @@ test("event bus isolates owners, system events, and dedupe keys", async () => {
   const adaPage = unwrap(
     await mcp(env, "poll_events", { subscription_id: adaPoll.id, visibility_seconds: 30 }, { token: ada.token, nowMs: NOW }),
   );
-  assert.deepEqual(whos(adaPage), ["ada", "legacy", "stock"]);
+  assert.deepEqual(whos(adaPage), ["ada", "stock"]);
   const beaPage = unwrap(
     await mcp(env, "poll_events", {
       subscription_id: beaPoll.id,
       visibility_seconds: 30,
     }, { token: bea.token, nowMs: NOW + 31000 }),
   );
-  assert.deepEqual(whos(beaPage), ["bea", "legacy", "stock"]);
+  assert.deepEqual(whos(beaPage), ["bea", "stock"]);
   const legacyPage = unwrap(
     await mcp(env, "poll_events", { subscription_id: legacyPoll.id, visibility_seconds: 30 }, { nowMs: NOW + 62000 }),
   );
@@ -656,7 +660,7 @@ test("event bus isolates owners, system events, and dedupe keys", async () => {
       visibility_seconds: 30,
     }, { token: ada.token, nowMs: NOW + 124000 }),
   );
-  assert.deepEqual(whos(medPage), ["ada", "legacy", "stock"]);
+  assert.deepEqual(whos(medPage), ["ada", "stock"]);
   assert.equal(medPage.events.some((row) => row.id === follow.id), false);
   const userPage = unwrap(
     await mcp(env, "poll_events", {
@@ -836,7 +840,7 @@ test("an account cannot list, retarget, delete, or rotate another webhook or a l
   assert.equal(adaAfter.secret_sealed, adaBefore.secret_sealed);
 });
 
-test("system events are leased per owner and a null webhook does not see other emits", async () => {
+test("system events are leased per owner and a legacy webhook does not see account or legacy-only emits", async () => {
   const { db, env } = sqliteEnv();
   env.SUBSCRIPTION_SEAL = Buffer.alloc(32, 9).toString("base64");
   env.DELIVER_QUEUE = { async send() {} };
@@ -854,11 +858,18 @@ test("system events are leased per owner and a null webhook does not see other e
       payload: { title: "ada private" },
     }, { token: ada.token }),
   );
-  const system = unwrap(
+  const iso = new Date(NOW).toISOString();
+  db.prepare(
+    `INSERT INTO events (
+      id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at, audience, owner_email
+    ) VALUES ('evt_systemnotic1', 'reminder.medication', '{"title":"system notice"}', 'pending', 'reminder.medication:system', ?, ?, 'emit', ?, 'bot', NULL)`,
+  ).run(iso, iso, iso);
+  const system = { id: "evt_systemnotic1" };
+  unwrap(
     await mcp(env, "emit_event", {
       type: "reminder.medication",
-      dedupe_key: "reminder.medication:system",
-      payload: { title: "system notice" },
+      dedupe_key: "reminder.medication:legacy-only",
+      payload: { title: "legacy only" },
     }),
   );
   assert.equal(

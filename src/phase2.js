@@ -18,6 +18,12 @@ const CURSOR_TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const RETRY_DELAYS = [60, 120, 240];
 const DELIVER_QUEUE_NAME = "abot-deliver";
 const DLQ_QUEUE_NAME = "abot-deliver-dlq";
+/**
+ * Bus owner for the legacy DATA_MCP_TOKEN. Not an email address, so no account
+ * can match it. Events owned by it reach only legacy (NULL-owner) subscriptions,
+ * and the legacy caller leases system events through event_claims like an account.
+ */
+export const LEGACY_OWNER = "legacy";
 const SECRET_KEYS = new Set([
   "secret",
   "token",
@@ -469,6 +475,11 @@ export function createPhase2(api) {
     return deps.ownerEmail;
   }
 
+  /** Lease identity on the bus: the account email, or LEGACY_OWNER. */
+  function busOwner(deps) {
+    return callerOwner(deps) ?? LEGACY_OWNER;
+  }
+
   async function ensureNullableColumn(deps, table, column) {
     const rows = await queryAll(
       deps,
@@ -601,15 +612,15 @@ export function createPhase2(api) {
 
   async function fanoutEvent(deps, event) {
     const ownerEmail = event.ownerEmail == null || event.ownerEmail === "" ? null : event.ownerEmail;
-    // Owned emits go only to that owner's webhooks. A NULL-owner webhook must
-    // not see them. System emits (NULL owner) still match every active webhook,
-    // which is the same set poll returns for an account plus the legacy subs.
+    // Owned emits go only to that owner's webhooks; LEGACY_OWNER emits go only
+    // to legacy (NULL-owner) webhooks. System emits (NULL owner) still match
+    // every active webhook, the same set poll returns for each caller.
     const subs = await queryAll(
       deps,
       `SELECT id, event_types FROM subscriptions
 WHERE status = 'active' AND mode = 'webhook'
-  AND (owner_email = ? OR (? IS NULL))`,
-      [ownerEmail, ownerEmail],
+  AND (? IS NULL OR owner_email = ? OR (? = ? AND (owner_email IS NULL OR owner_email = '')))`,
+      [ownerEmail, ownerEmail, ownerEmail, LEGACY_OWNER],
     );
     const nowMs = Date.parse(event.now);
     const visible = Date.parse(event.notBefore) <= nowMs;
@@ -639,6 +650,15 @@ WHERE status = 'active' AND mode = 'webhook'
     const ownerEmail = spec.ownerEmail == null || spec.ownerEmail === "" ? null : spec.ownerEmail;
     await ensureAudienceColumn(deps);
     await ensureEventOwnerIsolation(deps);
+    if (ownerEmail === LEGACY_OWNER) {
+      // Rows stored before legacy emits had an owner still dedupe legacy re-emits.
+      const stock = await queryFirst(
+        deps,
+        "SELECT id FROM events WHERE dedupe_key = ? AND status = 'pending' AND owner_email IS NULL",
+        [spec.dedupeKey],
+      );
+      if (stock) return { id: stock.id, created: false };
+    }
     for (let attempt = 0; attempt < 5; attempt++) {
       const id = newId("evt_");
       try {
@@ -694,9 +714,9 @@ WHERE status = 'active' AND mode = 'webhook'
       where.push("audience = ?");
       params.push(audience);
     }
-    if (typeof owner === "string") {
+    {
       // Own rows use the event lease. System rows use event_claims so one
-      // account cannot consume the lease for every other account.
+      // caller cannot consume the lease or the ack for every other caller.
       where.push(`(
         (owner_email = ? AND (leased_until IS NULL OR leased_until <= ?))
         OR (
@@ -713,13 +733,9 @@ WHERE status = 'active' AND mode = 'webhook'
         )
       )`);
       params.push(owner, now, owner, now);
-    } else {
-      where.push("owner_email IS NULL");
-      where.push("(leased_until IS NULL OR leased_until <= ?)");
-      params.push(now);
     }
     if (expiredLeaseOnly) {
-      if (typeof owner === "string") {
+      {
         where.push(`(
           (owner_email = ? AND leased_until IS NOT NULL)
           OR (
@@ -731,8 +747,6 @@ WHERE status = 'active' AND mode = 'webhook'
           )
         )`);
         params.push(owner, owner);
-      } else {
-        where.push("leased_until IS NOT NULL");
       }
     }
     if (beforeOrEqual) {
@@ -799,7 +813,7 @@ LIMIT ?`,
 
   async function retryAfterSeconds(deps, now, filters, audience, owner) {
     const rows = [];
-    if (typeof owner === "string") {
+    {
       const ownedParams = [now, owner, now];
       let ownedAud = "";
       if (audience) {
@@ -829,21 +843,6 @@ JOIN events e ON e.id = c.event_id
 WHERE e.status = 'pending' AND e.not_before <= ? AND e.owner_email IS NULL
   AND c.owner_email = ? AND c.acked_at IS NULL AND c.leased_until IS NOT NULL AND c.leased_until > ?${claimAud}`,
           claimParams,
-        )),
-      );
-    } else {
-      const params = [now, now];
-      let extra = " AND owner_email IS NULL";
-      if (audience) {
-        extra += " AND audience = ?";
-        params.push(audience);
-      }
-      rows.push(
-        ...(await queryAll(
-          deps,
-          `SELECT type, leased_until FROM events
-WHERE status = 'pending' AND not_before <= ? AND leased_until IS NOT NULL AND leased_until > ?${extra}`,
-          params,
         )),
       );
     }
@@ -898,15 +897,16 @@ FROM subscriptions`;
     const cursor = decodeCursor(has(args, "cursor") ? args.cursor : null);
     await ensureWebhookAuthColumn(deps);
     await ensureEventOwnerIsolation(deps);
-    const owner = callerOwner(deps);
-    if (typeof owner === "string") await ensureEventClaims(deps);
+    const caller = callerOwner(deps);
+    const owner = busOwner(deps);
+    await ensureEventClaims(deps);
     const sub = await queryFirst(
       deps,
       "SELECT id, mode, status, event_types, owner_email FROM subscriptions WHERE id = ?",
       [args.subscription_id],
     );
     if (!sub) throw notFound();
-    if (!subscriptionAllowed(owner, sub.owner_email)) throw notFound();
+    if (!subscriptionAllowed(caller, sub.owner_email)) throw notFound();
     if (sub.status === "paused") throw new RpcError(-32602, "subscription paused");
     if (sub.mode !== "poll" && sub.mode !== "webhook") throw notFound();
     const filters = parseFilters(sub.event_types);
@@ -927,10 +927,9 @@ FROM subscriptions`;
     let won = [];
     if (matches.length) {
       if (!deps || typeof deps.batch !== "function") throw new Error("batch is not configured");
-      const account = typeof owner === "string";
       const results = await deps.batch(
         matches.map((row, i) => {
-          const system = account && (row.owner_email == null || row.owner_email === "");
+          const system = row.owner_email == null || row.owner_email === "";
           if (system) {
             return {
               sql: `INSERT INTO event_claims (event_id, owner_email, lease_token, leased_until, poll_count, acked_at)
@@ -944,15 +943,12 @@ WHERE event_claims.acked_at IS NULL
               params: [row.id, owner, tokens[i], leasedUntil, now],
             };
           }
-          const params = [leasedUntil, tokens[i], now, row.id, now, now];
-          const ownerSql = account ? "AND owner_email = ?" : "AND owner_email IS NULL";
-          if (account) params.push(owner);
           return {
             sql: `UPDATE events
 SET leased_until = ?, lease_token = ?, poll_count = poll_count + 1, updated_at = ?
 WHERE id = ? AND status = 'pending' AND not_before <= ? AND (leased_until IS NULL OR leased_until <= ?)
-${ownerSql}`,
-            params,
+AND owner_email = ?`,
+            params: [leasedUntil, tokens[i], now, row.id, now, now, owner],
           };
         }),
       );
@@ -962,7 +958,7 @@ ${ownerSql}`,
     }
     const events = [];
     for (const { row, token } of won) {
-      const system = typeof owner === "string" && (row.owner_email == null || row.owner_email === "");
+      const system = row.owner_email == null || row.owner_email === "";
       let pollCount = Number(row.poll_count) + 1;
       if (system) {
         const claim = await queryFirst(
@@ -1014,7 +1010,7 @@ ${ownerSql}`,
     }
     if (typeof args.lease_token !== "string") throw new RpcError(-32602, "lease_token is required");
     await ensureEventOwnerIsolation(deps);
-    const caller = callerOwner(deps);
+    const caller = busOwner(deps);
     const now = nowIso(deps);
     const existing = await queryFirst(
       deps,
@@ -1023,13 +1019,9 @@ ${ownerSql}`,
     );
     if (!existing) throw notFound();
     const eventOwner = existing.owner_email == null || existing.owner_email === "" ? null : existing.owner_email;
-    if (caller == null) {
-      if (eventOwner != null) throw notFound();
-    } else if (eventOwner != null && eventOwner !== caller) {
-      throw notFound();
-    }
+    if (eventOwner != null && eventOwner !== caller) throw notFound();
     const cursor = encodeCursor(existing.created_at, existing.id);
-    if (caller != null && eventOwner == null) {
+    if (eventOwner == null) {
       await ensureEventClaims(deps);
       if (LEASE_RE.test(args.lease_token)) {
         const result = await queryRun(
@@ -1051,13 +1043,12 @@ WHERE event_id = ? AND owner_email = ? AND acked_at IS NULL AND lease_token = ?`
     }
     let changes = 0;
     if (LEASE_RE.test(args.lease_token)) {
-      const bind = ownerBind(caller);
       const result = await queryRun(
         deps,
         `UPDATE events
 SET status = 'acked', acked_at = ?, leased_until = NULL, lease_token = NULL, updated_at = ?
-WHERE id = ? AND status = 'pending' AND lease_token = ? AND ${bind.clause}`,
-        [now, now, id, args.lease_token, ...bind.params],
+WHERE id = ? AND status = 'pending' AND lease_token = ? AND owner_email = ?`,
+        [now, now, id, args.lease_token, caller],
       );
       changes = changesOf(result);
     }
@@ -1101,7 +1092,7 @@ ON CONFLICT(agent_id) DO UPDATE SET
       notBefore,
       source: "emit",
       audience,
-      ownerEmail: callerOwner(deps),
+      ownerEmail: busOwner(deps),
     });
   }
 
@@ -1343,12 +1334,13 @@ WHERE ce.id = ?
   AND NOT EXISTS (
     SELECT 1 FROM events e
     WHERE e.dedupe_key = 'calendar.due:' || ce.id || ':' || ce.start_utc
-      AND e.owner_email IS ce.owner_email
+      AND (e.owner_email IS ce.owner_email OR e.owner_email = COALESCE(ce.owner_email, ?))
   )`,
-      [eventId, now],
+      [eventId, now, LEGACY_OWNER],
     );
     if (!row) return false;
-    const ownerEmail = row.owner_email == null || row.owner_email === "" ? null : row.owner_email;
+    // A row without owner is legacy data: only the legacy caller may see it.
+    const ownerEmail = row.owner_email == null || row.owner_email === "" ? LEGACY_OWNER : row.owner_email;
     await insertBusEvent(deps, {
       type: "calendar.due",
       dedupeKey: `calendar.due:${row.id}:${row.start_utc}`,
@@ -1375,11 +1367,11 @@ WHERE ce.status = 'confirmed'
   AND NOT EXISTS (
     SELECT 1 FROM events e
     WHERE e.dedupe_key = 'calendar.due:' || ce.id || ':' || ce.start_utc
-      AND e.owner_email IS ce.owner_email
+      AND (e.owner_email IS ce.owner_email OR e.owner_email = COALESCE(ce.owner_email, ?))
   )
 ORDER BY ce.start_utc ASC, ce.id ASC
 LIMIT ?`,
-      [now, left, DETECT_LIMIT],
+      [now, left, LEGACY_OWNER, DETECT_LIMIT],
     );
     for (const row of rows) {
       await emitCalendarDueForEvent(deps, row.id);
