@@ -996,3 +996,32 @@ test("heartbeats are per owner: another account cannot mask or trigger a stale a
   assert.deepEqual(await types(beaPoll, bea.token), []);
   assert.deepEqual(await types(legacyPoll, undefined), ["watchdog.heartbeat_stale"]);
 });
+
+test("subscriptions are capped per owner and fan-out uses one queue batch", async () => {
+  const { env } = sqliteEnv();
+  env.SUBSCRIPTION_SEAL = Buffer.alloc(32, 4).toString("base64");
+  const batches = [];
+  env.DELIVER_QUEUE = {
+    async send() {
+      throw new Error("send should not be used when sendBatch exists");
+    },
+    async sendBatch(messages) {
+      batches.push(messages.map((m) => m.body.delivery_id));
+    },
+  };
+  const ada = await register(env, "ada@example.com", { ip: "203.0.113.140" });
+  for (let i = 0; i < 20; i++) {
+    unwrap(
+      await mcp(env, "create_subscription", { mode: "webhook", url: `https://example.com/ada/${i}`, event_types: ["*"] }, { token: ada.token }),
+    );
+  }
+  const over = rpcError(await mcp(env, "create_subscription", { mode: "poll" }, { token: ada.token }));
+  assert.equal(over.message, "subscription limit reached");
+  unwrap(await mcp(env, "create_subscription", { mode: "poll" }));
+
+  unwrap(
+    await mcp(env, "emit_event", { type: "reminder.medication", dedupe_key: "reminder.medication:many" }, { token: ada.token }),
+  );
+  assert.equal(batches.length, 1);
+  assert.equal(batches[0].length, 20);
+});

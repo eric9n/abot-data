@@ -205,7 +205,7 @@ agent 报到。默认 agent_id 为 bot:main，ttl_seconds 默认 600。不修改
 
 ## emit_event
 
-写入一条总线事件。拒绝 watchdog.* 和 calendar.due。新插入成功才扇出 webhook。audience 可选，只能是 bot 或 user，默认 bot。账户 token 写入的事件属于该邮箱；legacy token 写入系统事件。
+写入一条总线事件。拒绝 watchdog.* 和 calendar.due。新插入成功才扇出 webhook。audience 可选，只能是 bot 或 user，默认 bot。账户 token 写入的事件属于该邮箱；legacy token 写入的事件属于 legacy，只有 legacy 订阅看得到。
 
 参数：
 
@@ -217,7 +217,7 @@ agent 报到。默认 agent_id 为 bot:main，ttl_seconds 默认 600。不修改
 
 ## create_subscription
 
-创建 poll 或 webhook 订阅。不传 bearer_token 时 webhook 用 HMAC：服务端生成 secret，只在这次响应里出现。传入 bearer_token 时投递带 Authorization: Bearer，token 不回显。bearer_token 仅 webhook 可用，1 到 500 字符，不能含控制字符或换行。订阅记下调用方邮箱；legacy token 创建的订阅没有 owner，视为系统订阅。
+创建 poll 或 webhook 订阅。不传 bearer_token 时 webhook 用 HMAC：服务端生成 secret，只在这次响应里出现。传入 bearer_token 时投递带 Authorization: Bearer，token 不回显。bearer_token 仅 webhook 可用，1 到 500 字符，不能含控制字符或换行。订阅记下调用方邮箱；legacy token 创建的订阅没有 owner，视为系统订阅。每个账户最多 20 个订阅，legacy 最多 100 个，超出返回 subscription limit reached。
 
 参数：
 

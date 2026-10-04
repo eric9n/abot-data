@@ -23,6 +23,9 @@ export const EVENT_TTL_MS = 7 * DAY_MS;
 /** Finished events (acked or expired) and their claims and deliveries are deleted after this. */
 export const EVENT_KEEP_MS = 30 * DAY_MS;
 const RETENTION_LIMIT = 500;
+export const MAX_SUBSCRIPTIONS_PER_ACCOUNT = 20;
+export const MAX_LEGACY_SUBSCRIPTIONS = 100;
+const QUEUE_BATCH_MAX = 100;
 /**
  * Bus owner for the legacy DATA_MCP_TOKEN. Not an email address, so no account
  * can match it. Events owned by it reach only legacy (NULL-owner) subscriptions,
@@ -590,6 +593,24 @@ export function createPhase2(api) {
     await deps.sendDelivery(deliveryId);
   }
 
+  async function sendDeliveries(deps, ids, now) {
+    if (ids.length === 0) return;
+    const batched = deps && typeof deps.sendDeliveries === "function";
+    const chunk = batched ? QUEUE_BATCH_MAX : 1;
+    for (let i = 0; i < ids.length; i += chunk) {
+      const part = ids.slice(i, i + chunk);
+      try {
+        if (batched) await deps.sendDeliveries(part);
+        else await sendDelivery(deps, part[0]);
+      } catch (err) {
+        console.error(JSON.stringify({ msg: "deliver enqueue failed", delivery_ids: part, error: err && err.message }));
+        for (const id of part) {
+          await queryRun(deps, "UPDATE deliveries SET queued_at = NULL, updated_at = ? WHERE id = ?", [now, id]);
+        }
+      }
+    }
+  }
+
   async function insertDelivery(deps, eventId, subscriptionId, fields) {
     for (let attempt = 0; attempt < 5; attempt++) {
       const id = newId("dlv_");
@@ -629,6 +650,7 @@ WHERE status = 'active' AND mode = 'webhook'
     );
     const nowMs = Date.parse(event.now);
     const visible = Date.parse(event.notBefore) <= nowMs;
+    const queued = [];
     for (const sub of subs) {
       if (!eventTypeMatches(event.type, parseFilters(sub.event_types))) continue;
       const queuedAt = visible ? event.now : null;
@@ -638,14 +660,9 @@ WHERE status = 'active' AND mode = 'webhook'
         queuedAt,
         now: event.now,
       });
-      if (!id || !visible) continue;
-      try {
-        await sendDelivery(deps, id);
-      } catch (err) {
-        console.error(JSON.stringify({ msg: "deliver enqueue failed", delivery_id: id, error: err && err.message }));
-        await queryRun(deps, "UPDATE deliveries SET queued_at = NULL, updated_at = ? WHERE id = ?", [event.now, id]);
-      }
+      if (id && visible) queued.push(id);
     }
+    await sendDeliveries(deps, queued, event.now);
   }
 
   async function insertBusEvent(deps, spec) {
@@ -1146,6 +1163,10 @@ ON CONFLICT(owner_key, agent_id) DO UPDATE SET
     await ensureEventOwnerIsolation(deps);
     const ownerEmail = callerOwner(deps);
     const now = nowIso(deps);
+    const { clause, params } = ownerBind(ownerEmail);
+    const count = await queryFirst(deps, `SELECT COUNT(*) AS n FROM subscriptions WHERE ${clause}`, params);
+    const cap = ownerEmail == null ? MAX_LEGACY_SUBSCRIPTIONS : MAX_SUBSCRIPTIONS_PER_ACCOUNT;
+    if (count && Number(count.n) >= cap) throw new RpcError(-32602, "subscription limit reached");
     for (let attempt = 0; attempt < 5; attempt++) {
       const id = newId("sub_");
       let secret = null;
@@ -1819,6 +1840,15 @@ ORDER BY updated_at ASC, id ASC LIMIT ?`;
         if (!queue || typeof queue.send !== "function") throw new Error("deliver queue is not configured");
         await queue.send({ delivery_id: deliveryId });
       },
+      async sendDeliveries(deliveryIds) {
+        const queue = env && env.DELIVER_QUEUE;
+        if (queue && typeof queue.sendBatch === "function") {
+          await queue.sendBatch(deliveryIds.map((id) => ({ body: { delivery_id: id } })));
+          return;
+        }
+        if (!queue || typeof queue.send !== "function") throw new Error("deliver queue is not configured");
+        for (const id of deliveryIds) await queue.send({ delivery_id: id });
+      },
     };
   }
 
@@ -1826,7 +1856,7 @@ ORDER BY updated_at ASC, id ASC LIMIT ?`;
     {
       name: "poll_events",
       description:
-        "按订阅认领可见的 pending 事件。cursor 只翻页，不表示完成。返回 events、next_cursor、has_more、retry_after_seconds。传入 audience 时只返回该受众，不传则返回全部。账户 token 只返回自己的事件，外加还没被该账户认领的系统事件；系统事件按账户单独租约，不会被别人的 poll 抢走。别人的订阅、以及没有 owner 的系统订阅，与不存在一样，返回 not found。legacy token 只能 poll 系统订阅，并且只看到系统事件。",
+        "按订阅认领可见的 pending 事件。cursor 只翻页，不表示完成。返回 events、next_cursor、has_more、retry_after_seconds。传入 audience 时只返回该受众，不传则返回全部。账户 token 只返回自己的事件，外加还没被该账户认领的系统事件；系统事件按账户单独租约，不会被别人的 poll 抢走。别人的订阅、以及没有 owner 的系统订阅，与不存在一样，返回 not found。legacy token 只能 poll 系统订阅，看到 legacy 写入的事件和系统事件。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1867,7 +1897,7 @@ ORDER BY updated_at ASC, id ASC LIMIT ?`;
     },
     {
       name: "emit_event",
-      description: "写入一条总线事件。拒绝 watchdog.* 和 calendar.due。新插入成功才扇出 webhook。audience 可选，只能是 bot 或 user，默认 bot。账户 token 写入的事件属于该邮箱；legacy token 写入系统事件。",
+      description: "写入一条总线事件。拒绝 watchdog.* 和 calendar.due。新插入成功才扇出 webhook。audience 可选，只能是 bot 或 user，默认 bot。账户 token 写入的事件属于该邮箱；legacy token 写入的事件属于 legacy，只有 legacy 订阅看得到。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1884,7 +1914,7 @@ ORDER BY updated_at ASC, id ASC LIMIT ?`;
     {
       name: "create_subscription",
       description:
-        "创建 poll 或 webhook 订阅。不传 bearer_token 时 webhook 用 HMAC：服务端生成 secret，只在这次响应里出现。传入 bearer_token 时投递带 Authorization: Bearer，token 不回显。bearer_token 仅 webhook 可用，1 到 500 字符，不能含控制字符或换行。订阅记下调用方邮箱；legacy token 创建的订阅没有 owner，视为系统订阅。",
+        "创建 poll 或 webhook 订阅。不传 bearer_token 时 webhook 用 HMAC：服务端生成 secret，只在这次响应里出现。传入 bearer_token 时投递带 Authorization: Bearer，token 不回显。bearer_token 仅 webhook 可用，1 到 500 字符，不能含控制字符或换行。订阅记下调用方邮箱；legacy token 创建的订阅没有 owner，视为系统订阅。每个账户最多 20 个订阅，legacy 最多 100 个，超出返回 subscription limit reached。",
       inputSchema: {
         type: "object",
         properties: {
