@@ -1,11 +1,14 @@
 # abot-data Worker.
 #
-# A plain `wrangler deploy` is not allowed to publish production. This file
-# has no production route. The real D1 database_id, the cron trigger, and the
-# queue consumers are injected by the deployer. See deploy/ENV.md.
+# This file is for local development only. Production is published solely by
+# the Cloudflare Workers Builds trigger, which runs deploy/cloudflare.mjs to
+# generate dist/wrangler.json (real D1 database_id, Durable Object, service
+# binding, cron, queue consumers). A plain `wrangler deploy` of this file is
+# not a supported deploy path. See deploy/ENV.md.
 #
-# Production secrets are injected by the deployer and must never enter this
-# repository: DATA_MCP_TOKEN, SUBSCRIPTION_SEAL.
+# Production secrets live in the Worker's dashboard settings and must never
+# enter this repository: DATA_MCP_TOKEN, SUBSCRIPTION_SEAL, RESEND_API_KEY,
+# SCHEDULER_SECRET, INTERNAL_TOKEN.
 
 name = "abot-data"
 main = "src/worker.js"
