@@ -685,11 +685,11 @@ test("service binding owner email scopes requests to that account", async () => 
   const adaContact = unwrap(await mcp(env, "create_contact", { name: "Ada contact" }, { token: ada.token }));
   const beaContact = unwrap(await mcp(env, "create_contact", { name: "Bea contact" }, { token: bea.token }));
 
-  async function gwMcp(name, args, ownerEmail, extraHeaders = {}) {
+  async function gwMcp(name, args, ownerEmail, extraHeaders = {}, base = "https://backend.internal") {
     const headers = { "content-type": "application/json", ...extraHeaders };
     if (ownerEmail !== undefined) headers["x-abot-owner-email"] = ownerEmail;
     const res = await handleFetch(
-      new Request("https://abot-data.test/mcp", {
+      new Request(`${base}/mcp`, {
         method: "POST",
         headers,
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args ?? {} } }),
@@ -736,7 +736,7 @@ test("service binding owner email scopes requests to that account", async () => 
   assert.deepEqual(adaBound.sort(), [adaContact.id, bound.id].sort());
 
   const canonical = await handleFetch(
-    new Request(`https://abot-data.test/ctc/${adaContact.id}`, {
+    new Request(`https://backend.internal/ctc/${adaContact.id}`, {
       headers: { "x-abot-owner-email": "ada@example.com", "x-internal-token": "ignored" },
     }),
     env,
@@ -744,13 +744,47 @@ test("service binding owner email scopes requests to that account", async () => 
   assert.equal(canonical.status, 200);
   assert.equal((await canonical.json()).found, true);
   const hidden = await handleFetch(
-    new Request(`https://abot-data.test/ctc/${adaContact.id}`, {
+    new Request(`https://backend.internal/ctc/${adaContact.id}`, {
       headers: { "x-abot-owner-email": "bea@example.com" },
     }),
     env,
   );
   assert.equal((await hidden.json()).found, false);
+
+  // The owner header is only trusted on an internal hostname. A public
+  // hostname (route, custom domain, workers.dev) cannot impersonate anyone.
+  for (const publicBase of ["https://abot-data.test", "https://abot-data.boliam.workers.dev", "https://data.abot.run"]) {
+    assert.equal((await gwMcp("list_contacts", {}, "ada@example.com", {}, publicBase)).status, 401);
+    assert.equal(
+      (await gwMcp("list_contacts", {}, "ada@example.com", { authorization: `Bearer ${TOKEN}` }, publicBase)).status,
+      401,
+    );
+    const spoofed = await handleFetch(
+      new Request(`${publicBase}/ctc/${adaContact.id}`, { headers: { "x-abot-owner-email": "ada@example.com" } }),
+      env,
+    );
+    assert.equal(spoofed.status, 401);
+  }
 });
+
+test("record URLs use PUBLIC_ORIGIN behind the gateway", async () => {
+  const { env } = sqliteEnv();
+  env.PUBLIC_ORIGIN = "https://abot.run/data/";
+  const res = await handleFetch(
+    new Request("https://backend.internal/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "create_contact", arguments: { name: "Ada" } } }),
+    }),
+    env,
+    { nowMs: NOW },
+  );
+  const created = JSON.parse((await res.json()).result.content[0].text);
+  assert.equal(created.url, `https://abot.run/data/ctc/${created.id}`);
+  const meta = await handleFetch(new Request("https://backend.internal/.well-known/oauth-authorization-server"), env);
+  assert.equal((await meta.json()).token_endpoint, "https://abot.run/data/oauth/token");
+});
+
 
 test("an account cannot list, retarget, delete, or rotate another webhook or a legacy one", async () => {
   const { db, env } = sqliteEnv();

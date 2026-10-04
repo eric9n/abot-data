@@ -39,6 +39,7 @@ export function productionConfig(base, { databaseId }) {
     preview_urls: false,
     // Plain vars such as WRITE_RATE_LIMIT are managed in the dashboard.
     keep_vars: true,
+    vars: { PUBLIC_ORIGIN: "https://abot.run/data" },
     d1_databases: [{ binding: "DB", database_name: "abot-data", database_id: databaseId }],
     durable_objects: { bindings: [{ name: "SCHEDULER", class_name: "Scheduler" }] },
     // Declarative and compared against what is deployed. The live class is SQLite-backed.

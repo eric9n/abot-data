@@ -1623,6 +1623,26 @@ function json(body, status = 200) {
   });
 }
 
+/**
+ * Origin (plus optional path prefix) that clients use to reach this Worker.
+ * Behind the gateway the request URL is https://backend.internal, which is not
+ * addressable, so PUBLIC_ORIGIN (for example https://abot.run/data) wins.
+ */
+export function publicOrigin(request, env) {
+  const raw = env && typeof env.PUBLIC_ORIGIN === "string" ? env.PUBLIC_ORIGIN.trim() : "";
+  if (raw) {
+    try {
+      const url = new URL(raw);
+      if (url.protocol === "https:" && !url.search && !url.hash) {
+        return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+      }
+    } catch {
+      // Fall back to the request origin.
+    }
+  }
+  return new URL(request.url).origin;
+}
+
 function pathOf(request) {
   const url = new URL(request.url);
   if (url.pathname.length > 1 && url.pathname.endsWith("/")) return url.pathname.slice(0, -1);
@@ -1687,12 +1707,23 @@ async function accountEmailForToken(env, token) {
   return row && typeof row.email === "string" ? row.email : null;
 }
 
+/**
+ * Service bindings call this Worker on a hostname of their choosing; the
+ * gateway uses backend.internal. A public route or workers.dev request always
+ * carries the public hostname, so `.internal` is never reachable from outside.
+ */
+export function isInternalRequest(request) {
+  return new URL(request.url).hostname.toLowerCase().endsWith(".internal");
+}
+
 // Service Bindings are the gateway entry. A present X-Abot-Owner-Email must
-// be a real address and scopes the call to that account. X-Internal-Token is
-// not consulted. No owner header falls through to Bearer / anonymous.
+// be a real address and scopes the call to that account. It is honored only
+// on an internal hostname; on any other hostname it is rejected. X-Internal-Token
+// is not consulted. No owner header falls through to Bearer / anonymous.
 function bindingOwnerIdentity(request) {
   const ownerHeader = request.headers.get("x-abot-owner-email");
   if (ownerHeader == null || ownerHeader === "") return null;
+  if (!isInternalRequest(request)) return { kind: "unauthorized" };
   const email = normalizeAccountEmail(ownerHeader);
   if (!email) return { kind: "unauthorized" };
   return { kind: "account", email };
@@ -2002,7 +2033,7 @@ function authorizeAction(query) {
     params.set("code_challenge_method", "S256");
   }
   if (query.loginHint) params.set("login_hint", query.loginHint);
-  return `/oauth/authorize?${params.toString()}`;
+  return `authorize?${params.toString()}`;
 }
 
 function renderAuthorizePage(query, view) {
@@ -2143,7 +2174,7 @@ async function handleSchedulerDue(request, env, deps) {
   try {
     const body = await request.json().catch(() => null);
     const triggers = body && Array.isArray(body.triggers) ? body.triggers : [];
-    const runtime = phase2.bindRuntime(env, { nowMs: deps.nowMs, origin: new URL(request.url).origin });
+    const runtime = phase2.bindRuntime(env, { nowMs: deps.nowMs, origin: publicOrigin(request, env) });
     const results = [];
     for (const t of triggers) {
       if (!t || typeof t.id !== "string") continue;
@@ -2332,13 +2363,13 @@ async function handleOAuthToken(request, env, deps) {
 }
 
 export async function handleFetch(request, env, deps = {}) {
-  const origin = new URL(request.url).origin;
+  const origin = publicOrigin(request, env);
   const path = pathOf(request);
 
   // RFC 8414: OAuth 2.0 Authorization Server Metadata
   if (path === "/.well-known/oauth-authorization-server") {
     if (request.method !== "GET") return json({ ok: false, error: "method not allowed" }, 405);
-    const base = new URL(request.url).origin;
+    const base = origin;
     return json({
       issuer: base,
       authorization_endpoint: base + "/oauth/authorize",
@@ -2355,7 +2386,7 @@ export async function handleFetch(request, env, deps = {}) {
   // RFC 9728: OAuth 2.0 Protected Resource Metadata
   if (path === "/.well-known/oauth-protected-resource") {
     if (request.method !== "GET") return json({ ok: false, error: "method not allowed" }, 405);
-    const base = new URL(request.url).origin;
+    const base = origin;
     return json({
       resource: base + "/mcp",
       authorization_servers: [base],
@@ -2377,8 +2408,8 @@ export async function handleFetch(request, env, deps = {}) {
   }
 
   // 401 with WWW-Authenticate pointing to RFC 9728 resource metadata
-  function unauthorizedMcp(request) {
-    const base = new URL(request.url).origin;
+  function unauthorizedMcp() {
+    const base = origin;
     return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), {
       status: 401,
       headers: {
@@ -2392,11 +2423,11 @@ export async function handleFetch(request, env, deps = {}) {
     if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
     let identity = await resolveBearer(request, env);
     if (identity.kind === "error") return json({ ok: false }, 500);
-    if (identity.kind === "unauthorized") return unauthorizedMcp(request);
+    if (identity.kind === "unauthorized") return unauthorizedMcp();
     let message = null;
     if (identity.kind === "anonymous") {
       message = await readPublicAccountCall(request);
-      if (!message) return unauthorizedMcp(request);
+      if (!message) return unauthorizedMcp();
       identity = { kind: "public" };
     }
     if (!message) {
