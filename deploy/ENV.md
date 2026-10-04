@@ -36,6 +36,8 @@ wrangler 打包成单文件。源码是多模块：
 - `SELF`：指向 `abot-data` 自己的服务绑定，Scheduler 回调 `/internal/scheduler-due` 用
 - `DELIVER_QUEUE`：队列 `abot-deliver`；`RULE_EVENTS`：队列 `rule-events`（消费方是 `abot-rules`）
 - `workers_dev = false`、`preview_urls = false`：没有公网入口，只经服务绑定访问
+- 普通变量 `PUBLIC_ORIGIN = https://abot.run/data`：记录链接和 OAuth 元数据用的对外地址（gateway 去掉 `/data` 前缀后经服务绑定转发）
+- 普通变量 `WEBHOOK_DENY_DOMAINS`：逗号分隔，webhook 不能指向这些域名及其子域（本账户自己的 Worker 域名）。localhost、IP、`.internal`、`.local`、`.localhost`、`.localdomain`、`.home.arpa`、`.test`、`.invalid` 和单段主机名总是拒绝，末尾的点会先去掉。投递前会再检查一次，命中则标成 dead，`dead_reason` 为 `url_blocked`
 
 `compatibility_date` 为 `2026-09-01`。
 
@@ -76,7 +78,7 @@ Worker 用 batch 的 `queue` 名区分：`abot-deliver-dlq` 记死信，其余�
 
 生产 secrets 在控制台 Settings > Variables and Secrets 里维护，绝不进仓库。`wrangler deploy` 保留已有 secret；配置带 `keep_vars`，控制台设的普通变量（如 `WRITE_RATE_LIMIT`）也不会被部署清掉。
 
-- `DATA_MCP_TOKEN`：`POST /mcp` 与 canonical GET 的 legacy Bearer。它仍然能读写联系人、日历和笔记的全部行，`owner_email` 写成 NULL。总线 poll 只看到系统事件（`owner_email` 为空），不能借此读到账户事件。
+- `DATA_MCP_TOKEN`：`POST /mcp` 与 canonical GET 的 legacy Bearer。它仍然能读写联系人、日历和笔记的全部行，`owner_email` 写成 NULL。总线上它写入的事件属于 `legacy`，poll 看到 legacy 事件和库里历史上的系统事件（`owner_email` 为空），不能借此读到账户事件。
 - `SUBSCRIPTION_SEAL`：订阅 webhook secret 的封装密钥
 - `RESEND_API_KEY`：账户验证码邮件。Worker 只从该环境变量读取，值不进仓库、不进日志。发件人是 `abot-data@abot.run`。
 - `SCHEDULER_SECRET`：Durable Object 回调 `POST /internal/scheduler-due` 的 `X-Scheduler-Secret`。Worker 用恒定时间比较（`timingSafeEqual`）核对这个头。

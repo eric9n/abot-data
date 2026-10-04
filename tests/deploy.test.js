@@ -19,6 +19,8 @@ test("production config keeps the deploy contract from deploy/ENV.md", () => {
   assert.equal(config.preview_urls, false);
   assert.equal(config.keep_vars, true);
   assert.equal(config.vars.PUBLIC_ORIGIN, "https://abot.run/data");
+  assert.match(config.vars.WEBHOOK_DENY_DOMAINS, /(^|,)abot\.run(,|$)/);
+  assert.match(config.vars.WEBHOOK_DENY_DOMAINS, /(^|,)boliam\.workers\.dev(,|$)/);
   // X-Abot-Owner-Email is trusted on internal hostnames; never add a public entry.
   for (const key of ["route", "routes"]) assert.equal(key in config, false);
   assert.deepEqual(config.d1_databases, [{ binding: "DB", database_name: "abot-data", database_id: DB_ID }]);

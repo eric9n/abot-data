@@ -1880,3 +1880,41 @@ VALUES ('dlv_oldpendinga1', 'evt_oldpendinga1', 'sub_xaaaaaaaaaaa', 'due', ?, ?)
   assert.equal(countOf(db, "verification_requests"), 0);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'watchdog.queue_dlq'").get().n, 0);
 });
+
+test("webhook urls reject local, internal, trailing-dot, and same-account hosts, also at delivery", async () => {
+  const { db, env, sent } = sqliteEnv();
+  env.WEBHOOK_DENY_DOMAINS = "abot.run, boliam.workers.dev";
+  for (const url of [
+    "https://localhost./hook",
+    "https://127.0.0.1./hook",
+    "https://0x7f000001/hook",
+    "https://[::1]/hook",
+    "https://router.lan.localdomain/hook",
+    "https://printer.home.arpa/hook",
+    "https://backend.internal./hook",
+    "https://intranet/hook",
+    "https://abot.run/data/mcp",
+    "https://ABOT.RUN./x",
+    "https://abot-data.boliam.workers.dev/mcp",
+  ]) {
+    const err = rpcError(await mcp(env, "create_subscription", { mode: "webhook", url }));
+    assert.equal(err.message, "webhook url is invalid", url);
+  }
+  const ok = unwrap(await mcp(env, "create_subscription", { mode: "webhook", url: "https://notabot.run/hook", event_types: ["*"] }));
+  unwrap(await mcp(env, "emit_event", { type: "reminder.medication", dedupe_key: "reminder.medication:deny" }));
+  assert.equal(sent.length, 1);
+
+  env.WEBHOOK_DENY_DOMAINS = "notabot.run";
+  let fetched = 0;
+  await consumeDelivery({ body: sent[0] }, env, {
+    nowMs: NOW,
+    fetch: async () => {
+      fetched += 1;
+      return new Response("", { status: 200 });
+    },
+  });
+  assert.equal(fetched, 0);
+  const row = db.prepare("SELECT state, dead_reason FROM deliveries WHERE subscription_id = ?").get(ok.id);
+  assert.equal(row.state, "dead");
+  assert.equal(row.dead_reason, "url_blocked");
+});

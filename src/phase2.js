@@ -263,6 +263,25 @@ function isIpAddress(host) {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
 }
 
+const BLOCKED_HOST_SUFFIXES = [".local", ".localhost", ".internal", ".localdomain", ".home.arpa", ".test", ".invalid"];
+
+/** Comma-separated WEBHOOK_DENY_DOMAINS; each entry blocks the domain and its subdomains. */
+function webhookDenyDomains(env) {
+  const raw = env && typeof env.WEBHOOK_DENY_DOMAINS === "string" ? env.WEBHOOK_DENY_DOMAINS : "";
+  return raw
+    .split(",")
+    .map((d) => d.trim().toLowerCase().replace(/^\.+|\.+$/g, ""))
+    .filter(Boolean);
+}
+
+export function webhookHostBlocked(hostname, env) {
+  const host = String(hostname).toLowerCase().replace(/\.+$/, "");
+  if (host === "" || isIpAddress(host)) return true;
+  if (host === "localhost" || !host.includes(".")) return true;
+  if (BLOCKED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return true;
+  return webhookDenyDomains(env).some((d) => host === d || host.endsWith(`.${d}`));
+}
+
 function eventTypeMatches(type, filters) {
   for (const item of filters) {
     if (item === "*") return true;
@@ -343,7 +362,7 @@ export function createPhase2(api) {
     return value;
   }
 
-  function assertWebhookUrl(value) {
+  function assertWebhookUrl(value, env) {
     if (typeof value !== "string" || value.length < 1 || value.length > 500) {
       throw new RpcError(-32602, "webhook url is invalid");
     }
@@ -358,13 +377,7 @@ export function createPhase2(api) {
       throw new RpcError(-32602, "webhook url is invalid");
     }
     if (url.port !== "" && url.port !== "443") throw new RpcError(-32602, "webhook url is invalid");
-    if (isIpAddress(host)) throw new RpcError(-32602, "webhook url is invalid");
-    if (host === "localhost" || host === "localhost.localdomain") {
-      throw new RpcError(-32602, "webhook url is invalid");
-    }
-    if (host.endsWith(".local") || host.endsWith(".localhost") || host.endsWith(".internal")) {
-      throw new RpcError(-32602, "webhook url is invalid");
-    }
+    if (webhookHostBlocked(host, env)) throw new RpcError(-32602, "webhook url is invalid");
     return value;
   }
 
@@ -1155,7 +1168,7 @@ ON CONFLICT(owner_key, agent_id) DO UPDATE SET
       if (has(args, "bearer_token")) throw new RpcError(-32602, "bearer_token is not allowed");
     } else {
       if (!has(args, "url") || args.url == null || args.url === "") throw new RpcError(-32602, "url is required");
-      url = assertWebhookUrl(args.url);
+      url = assertWebhookUrl(args.url, deps && deps.env);
       if (has(args, "bearer_token")) bearerToken = assertBearerToken(args.bearer_token);
     }
     const webhookAuth = bearerToken == null ? "hmac" : "bearer";
@@ -1245,7 +1258,7 @@ LIMIT ?`,
     if (has(args, "url")) {
       if (existing.mode !== "webhook") throw new RpcError(-32602, "url is not allowed");
       sets.push("url = ?");
-      params.push(assertWebhookUrl(args.url));
+      params.push(assertWebhookUrl(args.url, deps && deps.env));
     }
     if (has(args, "event_types")) {
       sets.push("event_types = ?");
@@ -1641,6 +1654,18 @@ WHERE id = ? AND state IN ('due', 'inflight')`,
     if (changesOf(cas) !== 1) return { action: "ack" };
     if (!ctx.event) {
       await markDead(db, delivery.id, "retries_exhausted", delivery.last_error || "handler_crash", Number(delivery.attempts), now);
+      return { action: "ack" };
+    }
+    // The denylist may have grown since the subscription was created.
+    let target = null;
+    try {
+      target = new URL(sub.url);
+    } catch {
+      target = null;
+    }
+    if (!target || target.protocol !== "https:" || webhookHostBlocked(target.hostname, env)) {
+      await markDead(db, delivery.id, "url_blocked", "url_blocked", Number(delivery.attempts), now);
+      console.log(JSON.stringify({ msg: "deliver", delivery_id: delivery.id, state: "dead", last_error: "url_blocked" }));
       return { action: "ack" };
     }
     let secret;
