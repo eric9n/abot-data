@@ -26,6 +26,7 @@ const RETENTION_LIMIT = 500;
 export const MAX_SUBSCRIPTIONS_PER_ACCOUNT = 20;
 export const MAX_LEGACY_SUBSCRIPTIONS = 100;
 const QUEUE_BATCH_MAX = 100;
+const INFLIGHT_STALE_MS = 180 * 1000;
 /**
  * Bus owner for the legacy DATA_MCP_TOKEN. Not an email address, so no account
  * can match it. Events owned by it reach only legacy (NULL-owner) subscriptions,
@@ -1556,7 +1557,7 @@ LIMIT ?`,
   async function reclaimStuckInflight(deps) {
     const nowMs = nowMsOf(deps);
     const now = new Date(nowMs).toISOString();
-    const stuckBefore = new Date(nowMs - 180 * 1000).toISOString();
+    const stuckBefore = new Date(nowMs - INFLIGHT_STALE_MS).toISOString();
     await queryRun(
       deps,
       `UPDATE deliveries
@@ -1646,10 +1647,15 @@ WHERE id = ?`,
       }
       return { action: "ack" };
     }
+    // Another consumer may hold this row; take it over only once that attempt is stale.
+    const staleBefore = new Date(nowMs - INFLIGHT_STALE_MS).toISOString();
     const cas = await db.queryRun(
       `UPDATE deliveries SET state = 'inflight', inflight_at = ?, updated_at = ?
-WHERE id = ? AND state IN ('due', 'inflight')`,
-      [now, now, delivery.id],
+WHERE id = ? AND (
+  state = 'due'
+  OR (state = 'inflight' AND (inflight_at IS NULL OR inflight_at <= ?))
+)`,
+      [now, now, delivery.id, staleBefore],
     );
     if (changesOf(cas) !== 1) return { action: "ack" };
     if (!ctx.event) {

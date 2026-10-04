@@ -1918,3 +1918,21 @@ test("webhook urls reject local, internal, trailing-dot, and same-account hosts,
   assert.equal(row.state, "dead");
   assert.equal(row.dead_reason, "url_blocked");
 });
+
+test("a second consumer does not re-POST a delivery that is still inflight", async () => {
+  const { db, env, sent } = sqliteEnv();
+  unwrap(await mcp(env, "create_subscription", { mode: "webhook", url: "https://example.com/once", event_types: ["*"] }));
+  unwrap(await mcp(env, "emit_event", { type: "reminder.medication", dedupe_key: "reminder.medication:once" }));
+  const id = sent[0].delivery_id;
+  db.prepare("UPDATE deliveries SET state = 'inflight', inflight_at = ? WHERE id = ?").run(new Date(NOW - 60_000).toISOString(), id);
+  let posts = 0;
+  const fetch = async () => {
+    posts += 1;
+    return new Response("", { status: 200 });
+  };
+  await consumeDelivery({ body: { delivery_id: id } }, env, { nowMs: NOW, fetch });
+  assert.equal(posts, 0);
+  await consumeDelivery({ body: { delivery_id: id } }, env, { nowMs: NOW + 120_000, fetch });
+  assert.equal(posts, 1);
+  assert.equal(db.prepare("SELECT state FROM deliveries WHERE id = ?").get(id).state, "succeeded");
+});
