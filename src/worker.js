@@ -27,6 +27,7 @@ import {
   stableStringify,
   verifyWebhookRequest,
 } from "./phase2.js";
+import { assertRepeatFields, occurrenceAfter } from "./recurrence.js";
 
 export { buildWebhookBody, signWebhook, stableStringify, verifyWebhookRequest };
 export { Scheduler } from "./scheduler.js";
@@ -202,7 +203,10 @@ export function assertTimeOrder(startUtc, endUtc) {
   if (!(end > start)) throw new RpcError(-32602, "end_utc must be after start_utc");
 }
 
-/** Object or JSON text. freq must be none, daily, weekly, or monthly. */
+/**
+ * Object or JSON text. freq must be none, daily, weekly, or monthly; optional
+ * interval, until, and count are checked here and expanded in recurrence.js.
+ */
 export function normalizeRepeat(value) {
   let parsed = value;
   if (typeof value === "string") {
@@ -217,6 +221,11 @@ export function normalizeRepeat(value) {
   }
   if (typeof parsed.freq !== "string" || !REPEAT_FREQ.has(parsed.freq)) {
     throw new RpcError(-32602, "repeat.freq must be none, daily, weekly, or monthly");
+  }
+  try {
+    assertRepeatFields(parsed);
+  } catch (message) {
+    throw new RpcError(-32602, String(message));
   }
   return JSON.stringify(parsed);
 }
@@ -664,15 +673,17 @@ async function schedulerDO(deps) {
   }
 }
 
-async function scheduleCalendarDue(deps, eventId, startUtc) {
+/** Arms the alarm for the next occurrence after now; cancels it when there is none. */
+async function scheduleCalendarDue(deps, row) {
   const stub = await schedulerDO(deps);
   if (!stub) return;
   try {
-    const dueMs = Date.parse(startUtc);
-    if (!Number.isFinite(dueMs)) return;
-    // Only schedule future events
-    if (dueMs <= Date.now()) return;
-    await stub.schedule(`calendar:${eventId}`, dueMs, "calendar.due", { eventId });
+    const dueMs = occurrenceAfter(row.start_utc, row.timezone, row.repeat, nowMsOf(deps));
+    if (dueMs == null) {
+      await stub.cancel(`calendar:${row.id}`);
+      return;
+    }
+    await stub.schedule(`calendar:${row.id}`, dueMs, "calendar.due", { eventId: row.id });
   } catch (err) {
     console.error(JSON.stringify({ msg: "scheduleCalendarDue failed", error: err && err.message }));
   }
@@ -731,7 +742,7 @@ async function createEvent(args, deps) {
   );
   const result = { id, url: canonicalUrl(deps && deps.origin, id) };
   // Schedule precise due alarm (cron remains as backfill)
-  await scheduleCalendarDue(deps, id, start);
+  await scheduleCalendarDue(deps, { id, start_utc: start, timezone, repeat });
   await emitRuleEvent(deps, "calendar.created", "calendar_id", id);
   return result;
 }
@@ -842,7 +853,7 @@ async function updateEvent(args, deps) {
   if (row.status === "cancelled") {
     await cancelCalendarDue(deps, id);
   } else if (row.start_utc) {
-    await scheduleCalendarDue(deps, id, row.start_utc);
+    await scheduleCalendarDue(deps, row);
   }
   await emitRuleEvent(deps, "calendar.updated", "calendar_id", id);
   return { found: true, ...eventView(row, deps.origin) };
@@ -1324,7 +1335,7 @@ export const TOOLS = [
   {
     name: "create_event",
     description:
-      "新建日历事件。start_utc / end_utc 为 UTC ISO8601，end 必须晚于 start。repeat.freq 为 none、daily、weekly 或 monthly。返回 {id, url}，id 前缀 cal_。不检查 attendee_ids 是否已有联系人。",
+      "新建日历事件。start_utc / end_utc 为 UTC ISO8601，end 必须晚于 start。repeat.freq 为 none、daily、weekly 或 monthly，可选 interval（1 到 366）、until（ISO8601，含当次）、count（1 到 1000）；按 timezone 的本地时间重复，每次发生各发一条 calendar.due。返回 {id, url}，id 前缀 cal_。不检查 attendee_ids 是否已有联系人。",
     inputSchema: {
       type: "object",
       properties: {
@@ -2276,6 +2287,12 @@ async function handleSchedulerDue(request, env, deps) {
         if (t.type === "calendar.due") {
           const eventId = (t.payload && t.payload.eventId) || t.id.replace(/^calendar:/, "");
           const emitted = await phase2.emitCalendarDueForEvent(runtime, eventId, "scheduler");
+          const row = await queryFirst(
+            runtime,
+            "SELECT id, start_utc, timezone, repeat, status FROM calendar_events WHERE id = ?",
+            [eventId],
+          );
+          if (row && row.status === "confirmed") await scheduleCalendarDue({ env, nowMs: deps.nowMs }, row);
           results.push({ id: t.id, emitted });
         } else {
           results.push({ id: t.id, emitted: false, reason: "unknown type" });

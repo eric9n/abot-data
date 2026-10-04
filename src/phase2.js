@@ -3,6 +3,8 @@
  * Appended beside Phase 1. Does not change contact / calendar / note behavior.
  */
 
+import { occurrenceAtOrBefore, parseRepeat } from "./recurrence.js";
+
 const DAY_MS = 86_400_000;
 const SCAN_LIMIT = 500;
 const DETECT_LIMIT = 50;
@@ -1380,45 +1382,64 @@ WHERE subscription_id = ? AND state IN ('due', 'inflight', 'paused')`,
     };
   }
 
-  // Emit calendar.due for one event if not already emitted (any status).
-  // Returns true if emitted, false if skipped.
-  async function emitCalendarDueForEvent(deps, eventId, source) {
-    const nowMs = nowMsOf(deps);
-    const now = new Date(nowMs).toISOString();
-    await ensureEventOwnerIsolation(deps);
-    const row = await queryFirst(
-      deps,
-      `SELECT ce.id, ce.title, ce.start_utc, ce.end_utc, ce.timezone, ce.all_day, ce.location, ce.owner_email
-FROM calendar_events ce
-WHERE ce.id = ?
-  AND ce.status = 'confirmed'
-  AND ce.start_utc <= ?
-  AND NOT EXISTS (
-    SELECT 1 FROM events e
-    WHERE e.dedupe_key = 'calendar.due:' || ce.id || ':' || ce.start_utc
-      AND (e.owner_email IS ce.owner_email OR e.owner_email = COALESCE(ce.owner_email, ?))
-  )`,
-      [eventId, now, LEGACY_OWNER],
-    );
-    if (!row) return false;
+  const CALENDAR_FIELDS = "id, title, start_utc, end_utc, timezone, all_day, location, owner_email, repeat";
+  const REPEAT_FREQ_SQL = "CASE WHEN json_valid(repeat) THEN json_extract(repeat, '$.freq') END";
+  const DUE_WINDOW_MS = 7 * DAY_MS;
+  const RECURRING_PAGE = 500;
+  const RECURRING_MAX = 5000;
+
+  function dueKey(row, occMs) {
+    const startIso = Date.parse(row.start_utc) === occMs ? row.start_utc : new Date(occMs).toISOString();
+    return { startIso, key: `calendar.due:${row.id}:${startIso}` };
+  }
+
+  /** Emits calendar.due for one occurrence unless that occurrence was already emitted (any status). */
+  async function emitDueOccurrence(deps, row, occMs, source) {
+    const { startIso, key } = dueKey(row, occMs);
     // A row without owner is legacy data: only the legacy caller may see it.
     const ownerEmail = row.owner_email == null || row.owner_email === "" ? LEGACY_OWNER : row.owner_email;
+    const seen = await queryFirst(
+      deps,
+      "SELECT 1 AS n FROM events WHERE dedupe_key = ? AND (owner_email IS ? OR owner_email = ?)",
+      [key, row.owner_email ?? null, ownerEmail],
+    );
+    if (seen) return false;
+    const duration = Math.max(0, Date.parse(row.end_utc) - Date.parse(row.start_utc)) || 0;
+    const occurrence = { ...row, start_utc: startIso, end_utc: new Date(occMs + duration).toISOString() };
     await insertBusEvent(deps, {
       type: "calendar.due",
-      dedupeKey: `calendar.due:${row.id}:${row.start_utc}`,
-      payloadText: stableStringify(await buildCalendarDuePayload(row)),
-      notBefore: now,
+      dedupeKey: key,
+      payloadText: stableStringify(await buildCalendarDuePayload(occurrence)),
+      notBefore: new Date(nowMsOf(deps)).toISOString(),
       source: source || "detector",
       ownerEmail,
     });
     return true;
   }
 
+  // Emit calendar.due for the latest occurrence of one event at or before now.
+  // A repeating event only emits an occurrence from the last 7 days.
+  // Returns true if emitted, false if skipped.
+  async function emitCalendarDueForEvent(deps, eventId, source) {
+    const nowMs = nowMsOf(deps);
+    await ensureEventOwnerIsolation(deps);
+    const row = await queryFirst(
+      deps,
+      `SELECT ${CALENDAR_FIELDS} FROM calendar_events WHERE id = ? AND status = 'confirmed'`,
+      [eventId],
+    );
+    if (!row) return false;
+    const occMs = occurrenceAtOrBefore(row.start_utc, row.timezone, row.repeat, nowMs);
+    if (occMs == null) return false;
+    if (parseRepeat(row.repeat) && occMs < nowMs - DUE_WINDOW_MS) return false;
+    return emitDueOccurrence(deps, row, occMs, source);
+  }
+
   async function detectCalendarDue(deps) {
     await ensureEventOwnerIsolation(deps);
     const nowMs = nowMsOf(deps);
     const now = new Date(nowMs).toISOString();
-    const left = new Date(nowMs - 7 * DAY_MS).toISOString();
+    const left = new Date(nowMs - DUE_WINDOW_MS).toISOString();
     const rows = await queryAll(
       deps,
       `SELECT ce.id
@@ -1426,6 +1447,7 @@ FROM calendar_events ce
 WHERE ce.status = 'confirmed'
   AND ce.start_utc <= ?
   AND ce.start_utc >= ?
+  AND COALESCE(CASE WHEN json_valid(ce.repeat) THEN json_extract(ce.repeat, '$.freq') END, 'none') NOT IN ('daily', 'weekly', 'monthly')
   AND NOT EXISTS (
     SELECT 1 FROM events e
     WHERE e.dedupe_key = 'calendar.due:' || ce.id || ':' || ce.start_utc
@@ -1438,6 +1460,30 @@ LIMIT ?`,
     for (const row of rows) {
       await emitCalendarDueForEvent(deps, row.id);
     }
+    await detectRecurringDue(deps, nowMs);
+  }
+
+  async function detectRecurringDue(deps, nowMs) {
+    const now = new Date(nowMs).toISOString();
+    let after = "";
+    for (let scanned = 0; scanned < RECURRING_MAX; scanned += RECURRING_PAGE) {
+      const rows = await queryAll(
+        deps,
+        `SELECT ${CALENDAR_FIELDS} FROM calendar_events
+WHERE status = 'confirmed' AND start_utc <= ? AND id > ?
+  AND ${REPEAT_FREQ_SQL} IN ('daily', 'weekly', 'monthly')
+ORDER BY id ASC
+LIMIT ?`,
+        [now, after, RECURRING_PAGE],
+      );
+      for (const row of rows) {
+        const occMs = occurrenceAtOrBefore(row.start_utc, row.timezone, row.repeat, nowMs);
+        if (occMs != null && occMs >= nowMs - DUE_WINDOW_MS) await emitDueOccurrence(deps, row, occMs, "detector");
+      }
+      if (rows.length < RECURRING_PAGE) return;
+      after = rows[rows.length - 1].id;
+    }
+    console.error(JSON.stringify({ msg: "recurring calendar scan truncated", max: RECURRING_MAX }));
   }
 
   async function detectStaleHeartbeats(deps) {

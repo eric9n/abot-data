@@ -46,7 +46,7 @@
 
 ### create_event
 
-新建日历事件。start_utc / end_utc 为 UTC ISO8601，end 必须晚于 start。repeat.freq 为 none、daily、weekly 或 monthly。返回 {id, url}，id 前缀 cal_。不检查 attendee_ids 是否已有联系人。
+新建日历事件。start_utc / end_utc 为 UTC ISO8601，end 必须晚于 start。repeat.freq 为 none、daily、weekly 或 monthly，可选 interval（1 到 366）、until（ISO8601，含当次）、count（1 到 1000）；按 timezone 的本地时间重复，每次发生各发一条 calendar.due。返回 {id, url}，id 前缀 cal_。不检查 attendee_ids 是否已有联系人。
 
 必填：`title`、`start_utc`、`end_utc`
 

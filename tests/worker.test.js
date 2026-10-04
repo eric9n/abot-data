@@ -1936,3 +1936,86 @@ test("a second consumer does not re-POST a delivery that is still inflight", asy
   assert.equal(posts, 1);
   assert.equal(db.prepare("SELECT state FROM deliveries WHERE id = ?").get(id).state, "succeeded");
 });
+
+test("repeating events emit calendar.due once per occurrence", async () => {
+  const { db, env } = sqliteEnv();
+  const DAY = 86_400_000;
+  const daily = unwrap(
+    await mcp(env, "create_event", {
+      title: "Standup",
+      start_utc: "2026-09-01T01:00:00.000Z",
+      end_utc: "2026-09-01T01:15:00.000Z",
+      timezone: "Asia/Shanghai",
+      repeat: { freq: "daily", count: 40 },
+    }),
+  );
+  const stale = unwrap(
+    await mcp(env, "create_event", {
+      title: "Ended",
+      start_utc: "2026-08-01T01:00:00.000Z",
+      end_utc: "2026-08-01T02:00:00.000Z",
+      repeat: { freq: "weekly", until: "2026-08-20T00:00:00Z" },
+    }),
+  );
+  const bad = rpcError(
+    await mcp(env, "create_event", {
+      title: "x",
+      start_utc: "2026-09-01T01:00:00.000Z",
+      end_utc: "2026-09-01T02:00:00.000Z",
+      repeat: { freq: "daily", interval: 0 },
+    }),
+  );
+  assert.match(bad.message, /repeat\.interval/);
+
+  const due = () =>
+    db.prepare("SELECT dedupe_key, payload FROM events WHERE type = 'calendar.due' ORDER BY dedupe_key").all();
+  await handleScheduled({}, env, { nowMs: NOW });
+  await handleScheduled({}, env, { nowMs: NOW + 60_000 });
+  assert.deepEqual(due().map((r) => r.dedupe_key), [`calendar.due:${daily.id}:2026-09-29T01:00:00.000Z`]);
+  const payload = JSON.parse(due()[0].payload);
+  assert.equal(payload.start_utc, "2026-09-29T01:00:00.000Z");
+  assert.equal(payload.end_utc, "2026-09-29T01:15:00.000Z");
+  assert.equal(due().some((r) => r.dedupe_key.includes(stale.id)), false);
+
+  const res = await handleFetch(
+    new Request("https://abot-data.internal/internal/scheduler-due", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-scheduler-secret": "s" },
+      body: JSON.stringify({ triggers: [{ id: `calendar:${daily.id}`, type: "calendar.due", payload: { eventId: daily.id } }] }),
+    }),
+    { ...env, SCHEDULER_SECRET: "s" },
+    { nowMs: NOW + DAY },
+  );
+  assert.equal(res.status, 200);
+  assert.equal(due().length, 2);
+  assert.equal(due()[1].dedupe_key, `calendar.due:${daily.id}:2026-09-30T01:00:00.000Z`);
+
+  await handleScheduled({}, env, { nowMs: Date.parse("2026-10-15T00:00:00Z") });
+  assert.equal(due().at(-1).dedupe_key, `calendar.due:${daily.id}:2026-10-10T01:00:00.000Z`);
+  const count = due().length;
+  await handleScheduled({}, env, { nowMs: Date.parse("2026-10-20T00:00:00Z") });
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'calendar.due'").get().n, count);
+});
+
+test("creating a repeating event arms the scheduler for its next occurrence", async () => {
+  const { env } = sqliteEnv();
+  const calls = [];
+  env.SCHEDULER = {
+    idFromName: (name) => name,
+    get: () => ({
+      async schedule(id, dueMs) { calls.push(["schedule", id, new Date(dueMs).toISOString()]); },
+      async cancel(id) { calls.push(["cancel", id]); },
+    }),
+  };
+  const ev = unwrap(
+    await mcp(env, "create_event", {
+      title: "Weekly",
+      start_utc: "2026-09-01T01:00:00.000Z",
+      end_utc: "2026-09-01T02:00:00.000Z",
+      repeat: { freq: "weekly" },
+    }),
+  );
+  assert.deepEqual(calls, [["schedule", `calendar:${ev.id}`, "2026-10-06T01:00:00.000Z"]]);
+  unwrap(await mcp(env, "update_event", { id: ev.id, repeat: { freq: "none" } }));
+  assert.deepEqual(calls.at(-1), ["cancel", `calendar:${ev.id}`]);
+});
