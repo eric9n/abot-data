@@ -1108,24 +1108,26 @@ async function requestAccountVerification(args, deps) {
   return { ok: true };
 }
 
-async function bumpCodeAttempts(deps, email) {
-  await queryRun(deps, "UPDATE verification_codes SET attempts = attempts + 1 WHERE email = ?", [email]);
-}
-
-/** Shared by verify_account and the OAuth consent page. Does not issue a token. */
-async function assertVerificationCode(deps, email, code) {
+/**
+ * Shared by verify_account and the OAuth consent page. Counts the attempt and
+ * deletes the code in separate atomic statements, so two concurrent requests
+ * cannot both pass and a failed guess is always counted. Does not issue a token.
+ */
+async function consumeVerificationCode(deps, email, code) {
   if (typeof code !== "string" || !/^\d{6}$/.test(code)) {
     throw new RpcError(-32602, "code must be a 6-digit string");
   }
   const row = await queryFirst(
     deps,
-    "SELECT code_hash, expires_at, attempts FROM verification_codes WHERE email = ?",
-    [email],
+    `UPDATE verification_codes SET attempts = attempts + 1
+     WHERE email = ? AND attempts < ?
+     RETURNING code_hash, expires_at`,
+    [email, MAX_CODE_ATTEMPTS],
   );
-  if (!row) throw new RpcError(-32602, "invalid verification code");
-  if (Number(row.attempts) >= MAX_CODE_ATTEMPTS) {
-    await bumpCodeAttempts(deps, email);
-    throw new RpcError(-32602, "too many attempts");
+  if (!row) {
+    const exists = await queryFirst(deps, "SELECT 1 AS n FROM verification_codes WHERE email = ?", [email]);
+    if (exists) throw new RpcError(-32602, "too many attempts");
+    throw new RpcError(-32602, "invalid verification code");
   }
   const expiresMs = Date.parse(row.expires_at);
   if (!Number.isFinite(expiresMs) || nowMsOf(deps) >= expiresMs) {
@@ -1133,9 +1135,13 @@ async function assertVerificationCode(deps, email, code) {
   }
   const actual = await sha256Hex(code);
   if (typeof row.code_hash !== "string" || !timingSafeEqual(actual, row.code_hash)) {
-    await bumpCodeAttempts(deps, email);
     throw new RpcError(-32602, "invalid verification code");
   }
+  const deleted = await queryRun(deps, "DELETE FROM verification_codes WHERE email = ? AND code_hash = ?", [
+    email,
+    row.code_hash,
+  ]);
+  if (changesOf(deleted) !== 1) throw new RpcError(-32602, "invalid verification code");
 }
 
 async function issueAccountToken(deps, email) {
@@ -1159,9 +1165,8 @@ async function verifyAccount(args, deps) {
   assertOnlyKeys(args, new Set(["email", "code"]));
   const email = requireAccountEmail(args);
   if (!has(args, "code")) throw new RpcError(-32602, "code is required");
-  await assertVerificationCode(deps, email, args.code);
+  await consumeVerificationCode(deps, email, args.code);
   const token = await issueAccountToken(deps, email);
-  await queryRun(deps, "DELETE FROM verification_codes WHERE email = ?", [email]);
   return { ok: true, token };
 }
 
@@ -2139,9 +2144,7 @@ async function postOAuthAuthorize(request, query, runtime) {
     if (form.action === "verify") {
       const normalized = requireAccountEmail({ email: form.email });
       email = normalized;
-      await assertVerificationCode(runtime, normalized, form.code);
-      const deleted = await queryRun(runtime, "DELETE FROM verification_codes WHERE email = ?", [normalized]);
-      if (changesOf(deleted) !== 1) throw new RpcError(-32602, "invalid verification code");
+      await consumeVerificationCode(runtime, normalized, form.code);
       const code = newAuthorizationCode();
       const codeHash = await sha256Hex(code);
       const expiresAt = new Date(nowMsOf(runtime) + OAUTH_CODE_TTL_MS).toISOString();

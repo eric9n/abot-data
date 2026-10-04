@@ -257,7 +257,7 @@ test("verification codes expire, lock after five misses, and can be replaced", a
     await mcp(env, "verify_account", { email: "ada@example.com", code }, { token: null, nowMs: NOW }),
   );
   assert.equal(locked.message, "too many attempts");
-  assert.equal(db.prepare("SELECT attempts FROM verification_codes").get().attempts, 6);
+  assert.equal(db.prepare("SELECT attempts FROM verification_codes").get().attempts, 5);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM accounts").get().n, 0);
 
   const expiredRequest = await requestCode(env, "bea@example.com", { ip: "203.0.113.21" });
@@ -267,7 +267,7 @@ test("verification codes expire, lock after five misses, and can be replaced", a
     await mcp(env, "verify_account", { email: "bea@example.com", code: "111111" }, { token: null, nowMs: NOW + CODE_TTL }),
   );
   assert.equal(tooLate.message, "verification code expired");
-  assert.equal(db.prepare("SELECT attempts FROM verification_codes WHERE email = 'bea@example.com'").get().attempts, 0);
+  assert.equal(db.prepare("SELECT attempts FROM verification_codes WHERE email = 'bea@example.com'").get().attempts, 1);
 
   const fresh = await requestCode(env, "bea@example.com", { ip: "203.0.113.22", nowMs: NOW + CODE_TTL });
   unwrap(fresh.rpc);
@@ -1025,3 +1025,27 @@ test("subscriptions are capped per owner and fan-out uses one queue batch", asyn
   assert.equal(batches.length, 1);
   assert.equal(batches[0].length, 20);
 });
+
+test("a verification code is consumed once even when two verifies race", async () => {
+  const { db, env } = sqliteEnv();
+  const requested = await requestCode(env, "ada@example.com", { ip: "203.0.113.150" });
+  unwrap(requested.rpc);
+  const code = codeFromMail(requested.sent);
+  const results = await Promise.all([
+    mcp(env, "verify_account", { email: "ada@example.com", code }, { token: null }),
+    mcp(env, "verify_account", { email: "ada@example.com", code }, { token: null }),
+  ]);
+  const ok = results.filter((rpc) => rpc.body.error === undefined);
+  assert.equal(ok.length, 1);
+  const token = JSON.parse(ok[0].body.result.content[0].text).token;
+  assert.equal(db.prepare("SELECT token_hash FROM accounts").get().token_hash, sha256HexSync(token));
+  assert.equal(countRows(db, "verification_codes"), 0);
+});
+
+function sha256HexSync(text) {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+function countRows(db, table) {
+  return db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n;
+}
