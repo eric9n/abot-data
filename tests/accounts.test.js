@@ -969,3 +969,30 @@ test("authenticated writes are rate limited per owner", async () => {
   unwrap(await mcp(env, "create_contact", { name: "B1" }, { token: bea.token, nowMs: NOW + 4 }));
   unwrap(await mcp(env, "create_note", { title: "later" }, { token: ada.token, nowMs: NOW + 60 * 1000 }));
 });
+
+test("heartbeats are per owner: another account cannot mask or trigger a stale alert", async () => {
+  const { db, env } = sqliteEnv();
+  db.prepare("INSERT INTO heartbeats (agent_id, seen_at, ttl_seconds, updated_at) VALUES ('bot:main', ?, 60, ?)")
+    .run(new Date(NOW - 10 * HOUR).toISOString(), new Date(NOW - 10 * HOUR).toISOString());
+  const ada = await register(env, "ada@example.com", { ip: "203.0.113.130" });
+  const bea = await register(env, "bea@example.com", { ip: "203.0.113.131" });
+  const adaPoll = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["watchdog.*"] }, { token: ada.token }));
+  const beaPoll = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["watchdog.*"] }, { token: bea.token }));
+  const legacyPoll = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["watchdog.*"] }));
+  unwrap(await mcp(env, "heartbeat", { ttl_seconds: 120 }, { token: ada.token, nowMs: NOW - HOUR }));
+  unwrap(await mcp(env, "heartbeat", { ttl_seconds: 600 }, { token: bea.token, nowMs: NOW }));
+
+  await handleScheduled({}, env, { nowMs: NOW });
+  const stale = db.prepare("SELECT owner_email FROM events WHERE type = 'watchdog.heartbeat_stale' ORDER BY owner_email").all();
+  assert.deepEqual(stale.map((row) => row.owner_email), ["ada@example.com", "legacy"]);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM owner_heartbeats WHERE owner_key = 'legacy' AND agent_id = 'bot:main'").get().n,
+    1,
+  );
+
+  const types = async (sub, token) =>
+    unwrap(await mcp(env, "poll_events", { subscription_id: sub.id }, { token, nowMs: NOW })).events.map((row) => row.type);
+  assert.deepEqual(await types(adaPoll, ada.token), ["watchdog.heartbeat_stale"]);
+  assert.deepEqual(await types(beaPoll, bea.token), []);
+  assert.deepEqual(await types(legacyPoll, undefined), ["watchdog.heartbeat_stale"]);
+});

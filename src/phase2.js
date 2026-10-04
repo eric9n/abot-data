@@ -707,6 +707,27 @@ WHERE status = 'active' AND mode = 'webhook'
     );
   }
 
+  async function ensureOwnerHeartbeats(deps) {
+    await queryRun(
+      deps,
+      `CREATE TABLE IF NOT EXISTS owner_heartbeats (
+        owner_key TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        seen_at TEXT NOT NULL,
+        ttl_seconds INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (owner_key, agent_id)
+      )`,
+      [],
+    );
+    await queryRun(
+      deps,
+      `INSERT OR IGNORE INTO owner_heartbeats (owner_key, agent_id, seen_at, ttl_seconds, updated_at)
+SELECT ?, agent_id, seen_at, ttl_seconds, updated_at FROM heartbeats`,
+      [LEGACY_OWNER],
+    );
+  }
+
   async function listVisible(deps, now, { after, beforeOrEqual, expiredLeaseOnly, limit, audience, owner }) {
     const where = ["status = 'pending'", "not_before <= ?"];
     const params = [now];
@@ -1064,15 +1085,16 @@ WHERE id = ? AND status = 'pending' AND lease_token = ? AND owner_email = ?`,
     const agentId = readAgent(has(args, "agent_id") ? args.agent_id : null, "bot:main");
     const ttl = readTtl(has(args, "ttl_seconds") ? args.ttl_seconds : null);
     const now = nowIso(deps);
+    await ensureOwnerHeartbeats(deps);
     await queryRun(
       deps,
-      `INSERT INTO heartbeats (agent_id, seen_at, ttl_seconds, updated_at)
-VALUES (?, ?, ?, ?)
-ON CONFLICT(agent_id) DO UPDATE SET
+      `INSERT INTO owner_heartbeats (owner_key, agent_id, seen_at, ttl_seconds, updated_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(owner_key, agent_id) DO UPDATE SET
   seen_at = excluded.seen_at,
   ttl_seconds = excluded.ttl_seconds,
   updated_at = excluded.updated_at`,
-      [agentId, now, ttl, now],
+      [busOwner(deps), agentId, now, ttl, now],
     );
     return { agent_id: agentId, seen_at: now, ttl_seconds: ttl };
   }
@@ -1381,22 +1403,23 @@ LIMIT ?`,
   async function detectStaleHeartbeats(deps) {
     const nowMs = nowMsOf(deps);
     const now = new Date(nowMs).toISOString();
-    const agents = await queryAll(
+    await ensureEventOwnerIsolation(deps);
+    await ensureOwnerHeartbeats(deps);
+    const beats = await queryAll(
       deps,
-      `SELECT agent_id FROM subscriptions
-WHERE status = 'active' AND watch_heartbeat = 1
-GROUP BY agent_id
-ORDER BY agent_id ASC
+      `SELECT h.owner_key, h.agent_id, h.seen_at, h.ttl_seconds
+FROM (
+  SELECT COALESCE(NULLIF(owner_email, ''), ?) AS owner_key, agent_id
+  FROM subscriptions
+  WHERE status = 'active' AND watch_heartbeat = 1
+  GROUP BY 1, 2
+) s
+JOIN owner_heartbeats h ON h.owner_key = s.owner_key AND h.agent_id = s.agent_id
+ORDER BY h.owner_key ASC, h.agent_id ASC
 LIMIT ?`,
-      [DETECT_LIMIT],
+      [LEGACY_OWNER, DETECT_LIMIT],
     );
-    for (const agent of agents) {
-      const beat = await queryFirst(
-        deps,
-        "SELECT agent_id, seen_at, ttl_seconds FROM heartbeats WHERE agent_id = ?",
-        [agent.agent_id],
-      );
-      if (!beat) continue;
+    for (const beat of beats) {
       const seenMs = Date.parse(beat.seen_at);
       const ttl = Number(beat.ttl_seconds);
       if (Number.isNaN(seenMs) || !Number.isFinite(ttl)) continue;
@@ -1415,6 +1438,7 @@ LIMIT ?`,
         payloadText: stableStringify(payload),
         notBefore: now,
         source: "detector",
+        ownerEmail: beat.owner_key,
       });
     }
   }

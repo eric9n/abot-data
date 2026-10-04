@@ -148,6 +148,17 @@ CREATE TABLE IF NOT EXISTS heartbeats (
   updated_at TEXT NOT NULL
 );
 
+-- Heartbeats per owner. owner_key is the account email, or "legacy".
+-- Rows in the heartbeats table above are copied in as legacy; newer rows win.
+CREATE TABLE IF NOT EXISTS owner_heartbeats (
+  owner_key TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  seen_at TEXT NOT NULL,
+  ttl_seconds INTEGER NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (owner_key, agent_id)
+);
+
 -- Agent accounts. One email, one account. Codes and tokens are stored as
 -- SHA-256 hex. owner_email above is nullable so existing rows stay NULL.
 CREATE TABLE IF NOT EXISTS accounts (

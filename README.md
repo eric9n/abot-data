@@ -15,7 +15,7 @@ Worker 是多模块：主模块 `src/worker.js`，辅助模块 `src/phase2.js`�
 - **oauth**：connector 用 authorization code 绑定同一个账户。`GET /oauth/authorize` 渲染邮箱验证页，可以额外带 `code_challenge` 和 `code_challenge_method=S256`（只支持 S256；带了 challenge 但 method 不是 S256 会拒绝）。表单 POST 回同一地址发码、验码，通过后 302 回 `redirect_uri`，challenge 记在这条授权码上。`POST /oauth/token` 换 `ad_` token：登记了 secret 的客户端仍要校验 `client_secret`；授权码绑了 challenge 时必须带 `code_verifier`，S256（无填充的 base64url(SHA-256)）不一致就拒绝，并且不消耗授权码。`client_secret_hash` 为空字符串表示公开客户端，不校验 secret，授权时必须带 S256 challenge。不带 challenge 的 secret 流程保持可用。客户端登记在 `oauth_clients`（secret 只存 SHA-256，`redirect_uris` 是精确匹配的 JSON 数组）。授权码 10 分钟、一次性，库里只存 SHA-256。换到的 access token 就是该邮箱的 `ad_` token，再次签发会轮换并使旧 token 失效。
 - **events**：事件总线，用 audience 标签区分 bot 与 user。`ad_` token 写入的事件属于该邮箱，poll 只能看到自己的事件和 `owner_email` 为空的系统事件。系统事件按账户单独租约，一个账户 poll 或 ack 不会挡住其他账户。`DATA_MCP_TOKEN` 写入系统事件，poll 只看到系统事件。`calendar.due` 带日历行的 `owner_email`，不会当成系统事件广播。去重按账户分开。
 - **subscriptions**：外部订阅，webhook 推送支持 HMAC 与 Bearer 两种鉴权。创建时记下调用方邮箱；legacy 创建的订阅 `owner_email` 为空，只有 legacy token 能读、改、删、轮换和 poll。`ad_` token 不能把这种订阅当成总线旁路。别人的订阅与不存在一样，返回 not found。有 owner 的事件只投递给同一个 owner 的 webhook。
-- **heartbeats**：心跳。
+- **heartbeats**：心跳，按账户（或 legacy）分开记录和检测，见 `owner_heartbeats`。
 
 ## Webhook 鉴权
 
