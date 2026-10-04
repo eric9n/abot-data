@@ -1068,6 +1068,10 @@ test("concurrent writes and verification requests cannot overrun their limits", 
     db.prepare("SELECT COUNT(*) AS n FROM verification_requests WHERE email = 'bea@example.com'").get().n,
     3,
   );
+  for (let i = 0; i < 10; i++) {
+    const r = await requestCode(env, "cy@example.com", { ip: `203.0.113.${180 + i}` });
+    assert.equal(r.rpc.body.error === undefined, i < 3, `request ${i}`);
+  }
 });
 
 test("an account token can only request and verify a code for its own email", async () => {

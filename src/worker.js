@@ -1001,24 +1001,23 @@ async function reserveVerificationRequest(deps, email, ip, nowMs) {
   const since = new Date(nowMs - RATE_WINDOW_MS).toISOString();
   await queryRun(deps, "DELETE FROM verification_requests WHERE requested_at <= ?", [since]);
   const requestId = randomRequestId();
-  const requestedAt = new Date(nowMs).toISOString();
-  await queryRun(
+  const inserted = await queryFirst(
     deps,
-    "INSERT INTO verification_requests (id, email, ip, requested_at) VALUES (?, ?, ?, ?)",
-    [requestId, email, ip, requestedAt],
+    "INSERT INTO verification_requests (id, email, ip, requested_at) VALUES (?, ?, ?, ?) RETURNING rowid AS seq",
+    [requestId, email, ip, new Date(nowMs).toISOString()],
   );
-  // Count only rows ordered at or before this one, so concurrent requests admit
+  // Count only rows inserted at or before this one, so concurrent requests admit
   // exactly the first N instead of all rejecting each other.
-  const before = "requested_at > ? AND (requested_at < ? OR (requested_at = ? AND id <= ?))";
+  const seq = inserted ? inserted.seq : Number.MAX_SAFE_INTEGER;
   const emailRow = await queryFirst(
     deps,
-    `SELECT COUNT(*) AS n FROM verification_requests WHERE email = ? AND ${before}`,
-    [email, since, requestedAt, requestedAt, requestId],
+    "SELECT COUNT(*) AS n FROM verification_requests WHERE email = ? AND requested_at > ? AND rowid <= ?",
+    [email, since, seq],
   );
   const ipRow = await queryFirst(
     deps,
-    `SELECT COUNT(*) AS n FROM verification_requests WHERE ip = ? AND ${before}`,
-    [ip, since, requestedAt, requestedAt, requestId],
+    "SELECT COUNT(*) AS n FROM verification_requests WHERE ip = ? AND requested_at > ? AND rowid <= ?",
+    [ip, since, seq],
   );
   if (countValue(emailRow) > MAX_EMAIL_CODES || countValue(ipRow) > MAX_IP_CODES) {
     await queryRun(deps, "DELETE FROM verification_requests WHERE id = ?", [requestId]);
@@ -1835,14 +1834,35 @@ function oauthFail(err) {
   return json({ error: { code: -32603, message: "internal error" } }, 500);
 }
 
+// No form-action: the verify POST redirects to the client's redirect_uri.
+const OAUTH_PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'";
+
 function html(body, status = 200) {
   return new Response(body, {
     status,
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
+      "content-security-policy": OAUTH_PAGE_CSP,
+      "x-frame-options": "DENY",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
     },
   });
+}
+
+/**
+ * The consent form posts to itself. The page sets no-referrer, so a genuine
+ * submit carries Origin "null" or the page's own origin; anything else, or a
+ * browser that reports a cross-site or same-site fetch, did not come from it.
+ */
+function sameOriginFormPost(request, env) {
+  const site = request.headers.get("sec-fetch-site");
+  if (site && site !== "same-origin" && site !== "none") return false;
+  const origin = request.headers.get("origin");
+  if (origin == null || origin === "null") return true;
+  const allowed = new Set([new URL(request.url).origin, new URL(publicOrigin(request, env)).origin]);
+  return allowed.has(origin);
 }
 
 function escapeHtml(value) {
@@ -2051,6 +2071,14 @@ function authorizeAction(query) {
   return `authorize?${params.toString()}`;
 }
 
+function redirectHost(uri) {
+  try {
+    return new URL(uri).host;
+  } catch {
+    return "";
+  }
+}
+
 function renderAuthorizePage(query, view) {
   const email = view.email || "";
   const error = view.error ? `<p class="error">${escapeHtml(view.error)}</p>` : "";
@@ -2077,9 +2105,9 @@ function renderAuthorizePage(query, view) {
   <p>请确认要授权的客户端和回调地址。验证通过后才会回到连接方。</p>
   <dl>
     <dt>客户端</dt>
-    <dd><code>${escapeHtml(query.clientId)}</code></dd>
+    <dd>${query.clientName ? `${escapeHtml(query.clientName)} ` : ""}<code>${escapeHtml(query.clientId)}</code></dd>
     <dt>回调地址</dt>
-    <dd><code>${escapeHtml(query.redirectUri)}</code></dd>
+    <dd><strong>${escapeHtml(redirectHost(query.redirectUri))}</strong> <code>${escapeHtml(query.redirectUri)}</code></dd>
   </dl>
   ${error}
   ${sent}
@@ -2221,10 +2249,14 @@ async function handleOAuthAuthorize(request, env, deps) {
     if (!clientHasSecret(client) && !query.codeChallenge) {
       throw new RpcError(-32602, "code_challenge is required");
     }
+    query.clientName = client.name || "";
     if (request.method === "GET") {
       // login_hint only prefills the form. Sending a code or issuing an
       // authorization code requires the user to submit this confirmation page.
       return html(renderAuthorizePage(query, { email: query.loginHint || "" }));
+    }
+    if (!sameOriginFormPost(request, env)) {
+      return html(renderAuthorizePage(query, { error: "cross-site request rejected" }), 403);
     }
     return postOAuthAuthorize(request, query, runtime);
   } catch (err) {
@@ -2272,6 +2304,48 @@ async function readTokenBody(request) {
   throw new RpcError(-32602, "Content-Type must be application/json or application/x-www-form-urlencoded");
 }
 
+const DCR_PER_IP_PER_HOUR = 10;
+const DCR_PER_HOUR = 200;
+
+/** Open registration: cap per IP and overall per hour so oauth_clients cannot be flooded. */
+async function reserveClientRegistration(runtime) {
+  await queryRun(
+    runtime,
+    `CREATE TABLE IF NOT EXISTS oauth_client_registrations (
+      id TEXT PRIMARY KEY,
+      ip TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`,
+    [],
+  );
+  const nowMs = nowMsOf(runtime);
+  const now = new Date(nowMs).toISOString();
+  const since = new Date(nowMs - RATE_WINDOW_MS).toISOString();
+  await queryRun(runtime, "DELETE FROM oauth_client_registrations WHERE created_at <= ?", [since]);
+  const id = randomRequestId();
+  const ip = runtime.clientIp || "unknown";
+  const inserted = await queryFirst(
+    runtime,
+    "INSERT INTO oauth_client_registrations (id, ip, created_at) VALUES (?, ?, ?) RETURNING rowid AS seq",
+    [id, ip, now],
+  );
+  const seq = inserted ? inserted.seq : Number.MAX_SAFE_INTEGER;
+  const ipRow = await queryFirst(
+    runtime,
+    "SELECT COUNT(*) AS n FROM oauth_client_registrations WHERE ip = ? AND created_at > ? AND rowid <= ?",
+    [ip, since, seq],
+  );
+  const allRow = await queryFirst(
+    runtime,
+    "SELECT COUNT(*) AS n FROM oauth_client_registrations WHERE created_at > ? AND rowid <= ?",
+    [since, seq],
+  );
+  if (countValue(ipRow) > DCR_PER_IP_PER_HOUR || countValue(allRow) > DCR_PER_HOUR) {
+    await queryRun(runtime, "DELETE FROM oauth_client_registrations WHERE id = ?", [id]);
+    throw new RpcError(-32602, "too many client registrations");
+  }
+}
+
 async function handleOAuthRegister(request, env, deps) {
   if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
   try {
@@ -2291,6 +2365,7 @@ async function handleOAuthRegister(request, env, deps) {
     }
     const clientName = typeof body.client_name === "string" ? body.client_name.slice(0, 128) : "Dynamic client";
     const runtime = oauthRuntime(env, request, deps);
+    await reserveClientRegistration(runtime);
     const rand = crypto.getRandomValues(new Uint8Array(16));
     const clientId = "dcr_" + Array.from(rand).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 24);
     const secretBytes = crypto.getRandomValues(new Uint8Array(32));

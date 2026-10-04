@@ -112,6 +112,7 @@ async function postAuthorize(env, fields, opts = {}) {
       headers: {
         "content-type": "application/x-www-form-urlencoded",
         "cf-connecting-ip": opts.ip ?? "203.0.113.40",
+        ...(opts.headers ?? {}),
       },
       body: new URLSearchParams(fields),
     }),
@@ -639,4 +640,58 @@ test("confidential client pkce still requires client_secret", async () => {
   });
   assert.equal(ok.status, 200, JSON.stringify(ok.body));
   assert.match(ok.body.access_token, /^ad_[0-9a-f]{32}$/);
+});
+
+test("the consent page cannot be framed and rejects cross-site posts", async () => {
+  const { db, env } = sqliteEnv();
+  insertClient(db, { clientId: CLIENT, secret: SECRET, redirects: [REDIRECT], name: "Evil <b>Corp</b>" });
+  const page = await handleFetch(new Request(authorizeUrl()), env, { nowMs: NOW });
+  assert.equal(page.headers.get("x-frame-options"), "DENY");
+  assert.match(page.headers.get("content-security-policy"), /frame-ancestors 'none'/);
+  const body = await page.text();
+  assert.match(body, /Evil &lt;b&gt;Corp&lt;\/b&gt;/);
+  assert.match(body, new RegExp(`<strong>${new URL(REDIRECT).host.replace(/\./g, "\\.")}</strong>`));
+
+  const { sent, fetchImpl } = mailFetch();
+  for (const headers of [
+    { "sec-fetch-site": "cross-site" },
+    { "sec-fetch-site": "same-site" },
+    { origin: "https://evil.example" },
+  ]) {
+    const res = await postAuthorize(env, { action: "send", email: "ada@example.com" }, { headers, fetch: fetchImpl });
+    assert.equal(res.status, 403, JSON.stringify(headers));
+    assert.match(await res.text(), /cross-site request rejected/);
+  }
+  assert.equal(sent.length, 0);
+  for (const headers of [{ "sec-fetch-site": "same-origin", origin: "null" }, { origin: "https://abot-data.test" }]) {
+    const ok = await postAuthorize(env, { action: "send", email: "ada@example.com" }, { headers, fetch: fetchImpl });
+    assert.equal(ok.status, 200, JSON.stringify(headers));
+  }
+  env.PUBLIC_ORIGIN = "https://abot.run/data";
+  const viaGateway = await postAuthorize(
+    env,
+    { action: "send", email: "bea@example.com" },
+    { url: authorizeUrl().replace("https://abot-data.test", "https://backend.internal"), headers: { origin: "https://abot.run" }, fetch: fetchImpl },
+  );
+  assert.equal(viaGateway.status, 200);
+});
+
+test("dynamic client registration is limited per IP", async () => {
+  const { db, env } = sqliteEnv();
+  const register = (ip) =>
+    handleFetch(
+      new Request("https://abot-data.test/oauth/register", {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": ip },
+        body: JSON.stringify({ client_name: "x", redirect_uris: ["https://client.example/cb"] }),
+      }),
+      env,
+      { nowMs: NOW },
+    );
+  for (let i = 0; i < 10; i++) assert.equal((await register("198.51.100.1")).status, 200);
+  const blocked = await readJson(await register("198.51.100.1"));
+  assert.equal(blocked.status, 400);
+  assert.equal(blocked.body.error.message, "too many client registrations");
+  assert.equal((await register("198.51.100.2")).status, 200);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM oauth_clients").get().n, 11);
 });
