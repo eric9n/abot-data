@@ -27,13 +27,30 @@ function d1(db) {
   };
 }
 
-function fakeState() {
-  const data = new Map();
+function fakeState(initial = new Map()) {
+  const data = new Map(initial);
+  const sqlite = new DatabaseSync(":memory:");
+  const pending = [];
   const state = {
     alarmAt: null,
+    data,
+    blockConcurrencyWhile(fn) {
+      const p = fn();
+      pending.push(p);
+      return p;
+    },
+    ready: () => Promise.all(pending),
     storage: {
+      sql: {
+        exec(query, ...params) {
+          const stmt = sqlite.prepare(query);
+          const rows = /^\s*SELECT|\bRETURNING\b/i.test(query) ? stmt.all(...params) : (stmt.run(...params), []);
+          return { toArray: () => rows.map((r) => ({ ...r })) };
+        },
+      },
       async get(key) { return data.get(key); },
       async put(key, value) { data.set(key, structuredClone(value)); },
+      async delete(key) { return data.delete(key); },
       async setAlarm(ms) { state.alarmAt = ms; },
       async deleteAlarm() { state.alarmAt = null; },
     },
@@ -41,7 +58,7 @@ function fakeState() {
   return state;
 }
 
-function setup({ selfStatus } = {}) {
+function setup({ selfStatus, initial } = {}) {
   const db = new DatabaseSync(":memory:");
   db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
   const calls = [];
@@ -59,7 +76,7 @@ function setup({ selfStatus } = {}) {
       return handleFetch(request, env, { nowMs: NOW });
     },
   };
-  const state = fakeState();
+  const state = fakeState(initial);
   return { db, env, calls, state, scheduler: new Scheduler(state, env) };
 }
 
@@ -110,4 +127,31 @@ test("a failed handoff keeps the trigger and retries later", async () => {
   assert.equal(calls.length, 1);
   assert.deepEqual([...(await scheduler.getTriggers()).keys()], ["calendar:x"]);
   assert.ok(state.alarmAt >= before + 60_000);
+});
+
+test("triggers stored in the old KV blob move into the SQLite table once", async () => {
+  const due = Date.now() + 60_000;
+  const { state, scheduler } = setup({
+    initial: new Map([["triggers", { "calendar:a": { dueTimeMs: due, type: "calendar.due", payload: { eventId: "a" } } }]]),
+  });
+  await state.ready();
+  assert.equal(state.data.has("triggers"), false);
+  const triggers = await scheduler.getTriggers();
+  assert.deepEqual([...triggers.keys()], ["calendar:a"]);
+  assert.deepEqual(triggers.get("calendar:a").payload, { eventId: "a" });
+  assert.equal(state.alarmAt, due);
+  assert.deepEqual(await scheduler.cancel("calendar:a"), { ok: true, existed: true });
+  assert.equal(state.alarmAt, null);
+});
+
+test("alarm hands off at most one batch and leaves the rest due", async () => {
+  const { calls, scheduler, state } = setup({ selfStatus: 200 });
+  const past = Date.now() - 1000;
+  for (let i = 0; i < 150; i++) {
+    await scheduler.schedule(`calendar:${String(i).padStart(3, "0")}`, past, "calendar.due", { eventId: String(i) });
+  }
+  await scheduler.alarm();
+  assert.equal(calls.length, 1);
+  assert.equal((await scheduler.getTriggers()).size, 50);
+  assert.equal(state.alarmAt, past);
 });
