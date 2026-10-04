@@ -19,9 +19,13 @@ Worker 是多模块：主模块 `src/worker.js`，辅助模块 `src/phase2.js`�
 
 ## Webhook 鉴权
 
-`subscriptions.webhook_auth` 决定投递怎么鉴权，默认 `hmac`。两种模式都把密钥密封进 `secret_sealed`（密钥由部署方注入的 `SUBSCRIPTION_SEAL` 封装）。`get_subscription` 和 `list_subscriptions` 返回 `webhook_auth` 与 `has_secret`，不返回密钥本身。已经建好的 `subscriptions` 表在下次读取或投递时会补上这一列，旧行按 `hmac` 处理。
+`subscriptions.webhook_auth` 决定投递怎么鉴权，默认 `hmac`。两种模式都把密钥密封进 `secret_sealed`（密钥由 secret `SUBSCRIPTION_SEAL` 封装）。`get_subscription` 和 `list_subscriptions` 返回 `webhook_auth` 与 `has_secret`，不返回密钥本身。已经建好的 `subscriptions` 表在下次读取或投递时会补上这一列，旧行按 `hmac` 处理。
 
 - **hmac**（不传 `bearer_token`）：服务端生成 secret，只在 `create_subscription` 或 `rotate_subscription_secret` 的响应里出现一次。投递头保持 `x-abot-signature: v1=<hmac>`，并带 `user-agent`、`x-abot-timestamp`、`x-abot-event-id`、`x-abot-subscription-id`。
 - **bearer**（订阅方提供 `bearer_token`）：仅 webhook 模式。token 为 1～500 字符，拒绝控制字符和换行，以免注入投递头。响应不回显 token。投递头为 `Authorization: Bearer <token>`，保留上面四个头，不带 `x-abot-signature`。poll 传入 `bearer_token` 会拒绝。轮换 bearer 订阅时必须再提供新 token，同样不回显；hmac 订阅仍由服务端生成。
 
-生产 secrets（`DATA_MCP_TOKEN`、`SUBSCRIPTION_SEAL`、`RESEND_API_KEY`）和真实 D1 `database_id` 由部署方注入，不进入仓库。部署约定见 [deploy/ENV.md](deploy/ENV.md)。
+生产 secrets（`DATA_MCP_TOKEN`、`SUBSCRIPTION_SEAL`、`RESEND_API_KEY`、`SCHEDULER_SECRET`）和真实 D1 `database_id` 不进入仓库。
+
+## 部署
+
+唯一的发布方式是 Cloudflare 控制台里 `abot-data` 的 Workers Builds：推到 `main` 后自动执行 `npm test && node deploy/cloudflare.mjs build`，再执行 `node deploy/cloudflare.mjs deploy`（先跑幂等的 `schema.sql`，再 `wrangler deploy`）。脚本在 Workers Builds 之外直接退出，根目录 `wrangler.toml` 只用于本地开发。详见 [deploy/ENV.md](deploy/ENV.md)。
