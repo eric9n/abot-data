@@ -1445,35 +1445,44 @@ LIMIT ?`,
 
   async function detectDeadDeliveries(deps) {
     const now = nowIso(deps);
+    await ensureEventOwnerIsolation(deps);
+    await ensureNullableColumn(deps, "deliveries", "reported_at");
     const rows = await queryAll(
       deps,
-      `SELECT id, event_id, subscription_id, attempts, dead_reason, last_error
-FROM deliveries
-WHERE state = 'dead' AND dead_reason != 'subscription_deleted'
-ORDER BY updated_at ASC, id ASC
+      `SELECT d.id, d.event_id, d.subscription_id, d.attempts, d.dead_reason, d.last_error,
+  e.type AS event_type, s.id AS sub_id, s.owner_email AS sub_owner
+FROM deliveries d
+LEFT JOIN events e ON e.id = d.event_id
+LEFT JOIN subscriptions s ON s.id = d.subscription_id
+WHERE d.state = 'dead' AND d.reported_at IS NULL
+  AND COALESCE(d.dead_reason, '') != 'subscription_deleted'
+ORDER BY d.updated_at ASC, d.id ASC
 LIMIT ?`,
       [DETECT_LIMIT],
     );
     for (const row of rows) {
-      const event = await queryFirst(deps, "SELECT id, type FROM events WHERE id = ?", [row.event_id]);
-      if (!event) continue;
-      const payload = {
-        attempts: Number(row.attempts) || 0,
-        dead_reason: row.dead_reason || "",
-        delivery_id: row.id,
-        event_id: row.event_id,
-        event_type: event.type || "",
-        last_error: row.last_error || "",
-        queue: DLQ_QUEUE_NAME,
-        subscription_id: row.subscription_id,
-      };
-      await insertBusEvent(deps, {
-        type: "watchdog.queue_dlq",
-        dedupeKey: `watchdog.queue_dlq:${row.id}`,
-        payloadText: stableStringify(payload),
-        notBefore: now,
-        source: "detector",
-      });
+      // Without the subscription there is no owner to tell; never broadcast it.
+      if (row.event_type != null && row.sub_id != null) {
+        const payload = {
+          attempts: Number(row.attempts) || 0,
+          dead_reason: row.dead_reason || "",
+          delivery_id: row.id,
+          event_id: row.event_id,
+          event_type: row.event_type || "",
+          last_error: row.last_error || "",
+          queue: DLQ_QUEUE_NAME,
+          subscription_id: row.subscription_id,
+        };
+        await insertBusEvent(deps, {
+          type: "watchdog.queue_dlq",
+          dedupeKey: `watchdog.queue_dlq:${row.id}`,
+          payloadText: stableStringify(payload),
+          notBefore: now,
+          source: "detector",
+          ownerEmail: row.sub_owner == null || row.sub_owner === "" ? LEGACY_OWNER : row.sub_owner,
+        });
+      }
+      await queryRun(deps, "UPDATE deliveries SET reported_at = ? WHERE id = ?", [now, row.id]);
     }
   }
 

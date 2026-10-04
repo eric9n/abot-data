@@ -1429,6 +1429,33 @@ test("subscription_deleted does not raise queue_dlq; other dead letters do once 
   await handleScheduled({}, env, { nowMs: NOW + 2000 });
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'watchdog.queue_dlq'").get().n, 1);
   assert.equal(db.prepare("SELECT status FROM events WHERE id = ?").get(ev.id).status, "pending");
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(watch[0].id).owner_email, "legacy");
+  assert.equal(db.prepare("SELECT reported_at FROM deliveries WHERE id = ?").get(keptDelivery.id).reported_at !== null, true);
+  db.prepare("UPDATE events SET status = 'acked' WHERE id = ?").run(watch[0].id);
+  await handleScheduled({}, env, { nowMs: NOW + 3000 });
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'watchdog.queue_dlq'").get().n, 1);
+});
+
+test("queue_dlq goes to the dead subscription's owner only", async () => {
+  const { db, env } = sqliteEnv();
+  const iso = NOW_ISO;
+  db.prepare(
+    `INSERT INTO subscriptions (id, mode, status, url, created_at, updated_at, owner_email)
+VALUES ('sub_adahookaaaa1', 'webhook', 'active', 'https://example.com/ada', ?, ?, 'ada@example.com')`,
+  ).run(iso, iso);
+  db.prepare(
+    `INSERT INTO events (id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at, owner_email)
+VALUES ('evt_adaeventaaa1', 'reminder.medication', '{}', 'pending', 'reminder.medication:ada', ?, ?, 'emit', ?, 'ada@example.com')`,
+  ).run(iso, iso, iso);
+  db.prepare(
+    `INSERT INTO deliveries (id, event_id, subscription_id, state, attempts, dead_reason, last_error, created_at, updated_at)
+VALUES ('dlv_adadeadaaa1', 'evt_adaeventaaa1', 'sub_adahookaaaa1', 'dead', 3, 'http_status', '500', ?, ?),
+       ('dlv_orphanaaaa1', 'evt_adaeventaaa1', 'sub_goneaaaaaaa', 'dead', 3, 'http_status', '500', ?, ?)`,
+  ).run(iso, iso, iso, iso);
+  await handleScheduled({}, env, { nowMs: NOW + 1000 });
+  const rows = db.prepare("SELECT owner_email, dedupe_key FROM events WHERE type = 'watchdog.queue_dlq'").all();
+  assert.deepEqual(rows.map((row) => ({ ...row })), [{ owner_email: "ada@example.com", dedupe_key: "watchdog.queue_dlq:dlv_adadeadaaa1" }]);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE reported_at IS NULL").get().n, 0);
 });
 
 test("the dead-letter consumer records the row and does not POST", async () => {

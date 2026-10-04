@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
   dead_reason TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  reported_at TEXT,
   UNIQUE(event_id, subscription_id)
 );
 CREATE INDEX IF NOT EXISTS idx_deliveries_due
