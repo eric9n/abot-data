@@ -18,6 +18,11 @@ const CURSOR_TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const RETRY_DELAYS = [60, 120, 240];
 const DELIVER_QUEUE_NAME = "abot-deliver";
 const DLQ_QUEUE_NAME = "abot-deliver-dlq";
+/** Pending events whose not_before is older than this become 'expired'. */
+export const EVENT_TTL_MS = 7 * DAY_MS;
+/** Finished events (acked or expired) and their claims and deliveries are deleted after this. */
+export const EVENT_KEEP_MS = 30 * DAY_MS;
+const RETENTION_LIMIT = 500;
 /**
  * Bus owner for the legacy DATA_MCP_TOKEN. Not an email address, so no account
  * can match it. Events owned by it reach only legacy (NULL-owner) subscriptions,
@@ -1722,6 +1727,57 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     return { action: "ack" };
   }
 
+  async function runIgnoringMissingTable(deps, sql, params) {
+    try {
+      await queryRun(deps, sql, params);
+    } catch (err) {
+      const message = err && err.message ? String(err.message) : String(err);
+      if (/no such table/i.test(message)) return;
+      throw err;
+    }
+  }
+
+  async function applyRetention(deps) {
+    const nowMs = nowMsOf(deps);
+    const now = new Date(nowMs).toISOString();
+    const expireBefore = new Date(nowMs - EVENT_TTL_MS).toISOString();
+    const deleteBefore = new Date(nowMs - EVENT_KEEP_MS).toISOString();
+    await ensureNullableColumn(deps, "deliveries", "reported_at");
+    await ensureEventClaims(deps);
+    await queryRun(
+      deps,
+      `UPDATE events
+SET status = 'expired', leased_until = NULL, lease_token = NULL, updated_at = ?
+WHERE id IN (
+  SELECT id FROM events WHERE status = 'pending' AND not_before < ?
+  ORDER BY not_before ASC, id ASC LIMIT ?
+)`,
+      [now, expireBefore, RETENTION_LIMIT],
+    );
+    await queryRun(
+      deps,
+      `UPDATE deliveries
+SET state = 'dead', dead_reason = 'event_expired', last_error = 'event_expired', reported_at = ?, updated_at = ?
+WHERE state NOT IN ('succeeded', 'dead')
+  AND event_id IN (SELECT id FROM events WHERE status = 'expired' AND updated_at = ?)`,
+      [now, now, now],
+    );
+    const finished = `SELECT id FROM events
+WHERE status != 'pending' AND updated_at < ?
+  AND NOT EXISTS (
+    SELECT 1 FROM deliveries d WHERE d.event_id = events.id AND d.state NOT IN ('succeeded', 'dead')
+  )
+ORDER BY updated_at ASC, id ASC LIMIT ?`;
+    const finishedParams = [deleteBefore, RETENTION_LIMIT];
+    await queryRun(deps, `DELETE FROM deliveries WHERE event_id IN (${finished})`, finishedParams);
+    await queryRun(deps, `DELETE FROM event_claims WHERE event_id IN (${finished})`, finishedParams);
+    await queryRun(deps, `DELETE FROM events WHERE id IN (${finished})`, finishedParams);
+    const dayAgo = new Date(nowMs - DAY_MS).toISOString();
+    await runIgnoringMissingTable(deps, "DELETE FROM oauth_codes WHERE expires_at < ?", [dayAgo]);
+    await runIgnoringMissingTable(deps, "DELETE FROM verification_codes WHERE expires_at < ?", [dayAgo]);
+    await runIgnoringMissingTable(deps, "DELETE FROM verification_requests WHERE requested_at < ?", [dayAgo]);
+  }
+
   async function handleScheduled(_event, env, deps = {}) {
     const ctx = bindRuntime(env, deps);
     await detectCalendarDue(ctx);
@@ -1729,6 +1785,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     await detectDeadDeliveries(ctx);
     await requeueDueDeliveries(ctx);
     await reclaimStuckInflight(ctx);
+    await applyRetention(ctx);
   }
 
   async function handleQueue(batch, env, deps = {}) {

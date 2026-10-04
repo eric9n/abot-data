@@ -1838,3 +1838,45 @@ test("a subscriptions table from before webhook_auth still delivers hmac", async
   const poll = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }));
   assert.equal(unwrap(await mcp(env, "get_subscription", { id: poll.id })).webhook_auth, "hmac");
 });
+
+test("cron expires week-old pending events and deletes month-old finished rows", async () => {
+  const { db, env } = sqliteEnv();
+  const DAY = 86_400_000;
+  const at = (ms) => new Date(ms).toISOString();
+  const insert = db.prepare(
+    `INSERT INTO events (id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at, owner_email)
+VALUES (?, 'reminder.medication', '{}', ?, ?, ?, ?, 'emit', ?, ?)`,
+  );
+  insert.run("evt_freshaaaaaa1", "pending", "k:fresh", at(NOW - DAY), at(NOW - DAY), at(NOW - DAY), "legacy");
+  insert.run("evt_oldpendinga1", "pending", "k:old", at(NOW - 8 * DAY), at(NOW - 8 * DAY), at(NOW - 8 * DAY), null);
+  insert.run("evt_oldackedaaa1", "acked", "k:acked", at(NOW - 40 * DAY), at(NOW - 40 * DAY), at(NOW - 31 * DAY), "legacy");
+  insert.run("evt_busyackedaa1", "acked", "k:busy", at(NOW - 40 * DAY), at(NOW - 40 * DAY), at(NOW - 31 * DAY), "legacy");
+  db.prepare(
+    `INSERT INTO deliveries (id, event_id, subscription_id, state, created_at, updated_at)
+VALUES ('dlv_oldpendinga1', 'evt_oldpendinga1', 'sub_xaaaaaaaaaaa', 'due', ?, ?),
+       ('dlv_oldackedaaa1', 'evt_oldackedaaa1', 'sub_xaaaaaaaaaaa', 'succeeded', ?, ?),
+       ('dlv_busyackedaa1', 'evt_busyackedaa1', 'sub_xaaaaaaaaaaa', 'due', ?, ?)`,
+  ).run(...Array(6).fill(at(NOW - 31 * DAY)));
+  db.exec(`CREATE TABLE IF NOT EXISTS event_claims (
+    event_id TEXT NOT NULL, owner_email TEXT NOT NULL, lease_token TEXT, leased_until TEXT,
+    poll_count INTEGER NOT NULL DEFAULT 0, acked_at TEXT, PRIMARY KEY (event_id, owner_email))`);
+  db.prepare("INSERT INTO event_claims (event_id, owner_email, acked_at) VALUES ('evt_oldackedaaa1', 'ada@example.com', ?)")
+    .run(at(NOW - 31 * DAY));
+  db.prepare("INSERT INTO verification_requests (id, email, ip, requested_at) VALUES ('vr1', 'a@example.com', '1', ?)")
+    .run(at(NOW - 2 * DAY));
+
+  await handleScheduled({}, env, { nowMs: NOW });
+  const status = (id) => db.prepare("SELECT status FROM events WHERE id = ?").get(id)?.status ?? null;
+  assert.equal(status("evt_freshaaaaaa1"), "pending");
+  assert.equal(status("evt_oldpendinga1"), "expired");
+  assert.equal(status("evt_oldackedaaa1"), null);
+  assert.equal(status("evt_busyackedaa1"), "acked");
+  const expiredDelivery = db.prepare("SELECT state, dead_reason, reported_at FROM deliveries WHERE id = 'dlv_oldpendinga1'").get();
+  assert.equal(expiredDelivery.state, "dead");
+  assert.equal(expiredDelivery.dead_reason, "event_expired");
+  assert.equal(expiredDelivery.reported_at, NOW_ISO);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE id = 'dlv_oldackedaaa1'").get().n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM event_claims").get().n, 0);
+  assert.equal(countOf(db, "verification_requests"), 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'watchdog.queue_dlq'").get().n, 0);
+});
