@@ -7,8 +7,8 @@
 # not a supported deploy path. See deploy/ENV.md.
 #
 # Production secrets live in the Worker's dashboard settings and must never
-# enter this repository: DATA_MCP_TOKEN, SUBSCRIPTION_SEAL, RESEND_API_KEY,
-# SCHEDULER_SECRET, INTERNAL_TOKEN.
+# enter this repository: DATA_MCP_TOKEN, SUBSCRIPTION_SEAL, and the others
+# listed in deploy/ENV.md.
 
 name = "abot-data"
 main = "src/worker.js"
