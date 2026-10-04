@@ -41,6 +41,7 @@ test("production config keeps the deploy contract from deploy/ENV.md", () => {
   assert.deepEqual(config.exports, { Scheduler: { type: "durable-object", storage: "sqlite" } });
   assert.deepEqual(config.services, [{ binding: "SELF", service: "abot-data" }]);
   assert.deepEqual(config.triggers.crons, ["*/5 * * * *"]);
+  assert.deepEqual(config.observability, { enabled: true });
   assert.deepEqual(
     config.queues.producers.map((p) => [p.binding, p.queue]),
     [["DELIVER_QUEUE", "abot-deliver"], ["RULE_EVENTS", "rule-events"]],

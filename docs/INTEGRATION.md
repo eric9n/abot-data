@@ -4,13 +4,13 @@ Abot Data is a personal structured data layer for AI agents: calendar, contacts,
 notes, and an event bus, exposed via MCP (Model Context Protocol) over
 Streamable HTTP.
 
-- Production MCP endpoint: `https://data.abot.run/mcp`
-- Health check (public): `https://data.abot.run/health`
+- Production MCP endpoint: `https://abot.run/data/mcp`
+- Health check (public): `https://abot.run/data/health`
 
 ## Authentication
 
 Every agent gets its own account, identified by email. Data is isolated per
-account: you only see rows that belong to your email (plus system-level rows).
+account: you only see rows that belong to your email.
 
 There are two ways to get a token. Both end up with the same kind of token.
 OAuth is a generic standard — it is not Muse-specific. Any agent can use it.
@@ -24,16 +24,16 @@ a browser for the user.
 
 | | |
 |---|---|
-| Authorize | `https://data.abot.run/oauth/authorize` |
-| Token | `https://data.abot.run/oauth/token` |
-| Dynamic client registration (RFC 7591) | `https://data.abot.run/oauth/register` |
+| Authorize | `https://abot.run/data/oauth/authorize` |
+| Token | `https://abot.run/data/oauth/token` |
+| Dynamic client registration (RFC 7591) | `https://abot.run/data/oauth/register` |
 
 **Step 0 — Register your client (one time, optional)**
 
 If you don't have a pre-registered `client_id`, register dynamically:
 
 ```http
-POST https://data.abot.run/oauth/register
+POST https://abot.run/data/oauth/register
 Content-Type: application/json
 
 {
@@ -60,7 +60,7 @@ but then `redirect_uri` must be pre-allowlisted.
 **Step 1 — Redirect the user to the authorize URL**
 
 ```
-https://data.abot.run/oauth/authorize?
+https://abot.run/data/oauth/authorize?
   response_type=code
   &client_id=<your-client-id>
   &redirect_uri=<your-callback-url>
@@ -75,7 +75,9 @@ https://data.abot.run/oauth/authorize?
 - `redirect_uri`: must be an exact match of a URI registered in Step 0
   (or a pre-allowlisted URI).
 - `login_hint`: optional. When present, the email field is pre-filled. The
-  page shows `client_id` and `redirect_uri` for the user to confirm. A GET
+  page shows the client name, `client_id`, and the `redirect_uri` host for the
+  user to confirm. It cannot be framed, and form posts from another site are
+  rejected. A GET
   does not send a verification code and does not issue an authorization code;
   the user submits the form to send the code.
 
@@ -97,7 +99,7 @@ Verify `state` matches what you sent.
 **Step 4 — Exchange the code for a token**
 
 ```
-POST https://data.abot.run/oauth/token
+POST https://abot.run/data/oauth/token
 Content-Type: application/x-www-form-urlencoded
 
 grant_type=authorization_code
@@ -114,8 +116,9 @@ Response:
 ```
 
 - Codes are single-use and expire after 10 minutes.
-- The access token is bound to the verified email. Re-issuing rotates it and
-  invalidates the previous one.
+- The access token is bound to the verified email and to this `client_id`.
+  Authorizing the same client again rotates that client's token only; tokens
+  of other clients and the one from `verify_account` keep working.
 
 ### Option B: Manual token via MCP tools (for headless/programmatic agents)
 
@@ -132,7 +135,7 @@ The token is shown **once**. Store it securely; never log it or commit it.
 ## Making MCP calls
 
 ```http
-POST https://data.abot.run/mcp
+POST https://abot.run/data/mcp
 Authorization: Bearer ad_<your-token>
 Content-Type: application/json
 
@@ -159,16 +162,21 @@ Without a token (or with a wrong one) you get HTTP 401, except for
 
 ## Data isolation
 
-- An `ad_` token only reads/writes rows where `owner_email` equals its own
-  email, plus system rows where `owner_email` is null.
-- Events: `poll_events` returns your account's events plus system-level events.
-  You cannot see other accounts' events.
-- Dedupe keys are scoped per account.
+- An `ad_` token only reads/writes contacts, calendar events, and notes where
+  `owner_email` equals its own email.
+- Events: `poll_events` returns your account's events plus system-level events
+  (old rows with no owner). You cannot see other accounts' events, and webhooks
+  only receive your own account's events.
+- `calendar.due` fires for each occurrence of a repeating event, in the event's
+  timezone. `watchdog.heartbeat_stale` and `watchdog.queue_dlq` are raised per
+  account from that account's own heartbeats and deliveries.
+- Dedupe keys are scoped per account. Pending events expire after 7 days.
 
 ## Tool overview
 
 27 tools across: accounts (2), contacts (5), calendar (5), notes (5),
-events (4), subscriptions (4), heartbeats (1), plus `tools/list`.
+events (3: `poll_events`, `ack_event`, `emit_event`), subscriptions (6), and
+`heartbeat` (1).
 
 Full schemas: call `tools/list`, or read `skills/abot-data/references/tools.md`
 in this repo.
@@ -176,4 +184,10 @@ in this repo.
 ## Rate limits
 
 - Verification emails: 3 per hour per email, 10 per hour per IP.
-- Verification codes: 15 minutes valid, 5 wrong attempts lock the code.
+- Verification codes: 15 minutes valid, 5 attempts lock the code.
+- With an `ad_` token, `request_account_verification` and `verify_account`
+  only accept that account's own email.
+- Dynamic client registration: 10 per hour per IP.
+- Subscriptions: at most 20 per account. Webhook URLs must be public HTTPS
+  hosts (no IPs, localhost, `.internal`, `.local`, or abot's own domains).
+- Writes: 120 per minute per account by default.

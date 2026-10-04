@@ -24,7 +24,7 @@ Worker 是多模块：主模块 `src/worker.js`，辅助模块 `src/phase2.js`�
 - **hmac**（不传 `bearer_token`）：服务端生成 secret，只在 `create_subscription` 或 `rotate_subscription_secret` 的响应里出现一次。投递头保持 `x-abot-signature: v1=<hmac>`，并带 `user-agent`、`x-abot-timestamp`、`x-abot-event-id`、`x-abot-subscription-id`。
 - **bearer**（订阅方提供 `bearer_token`）：仅 webhook 模式。token 为 1～500 字符，拒绝控制字符和换行，以免注入投递头。响应不回显 token。投递头为 `Authorization: Bearer <token>`，保留上面四个头，不带 `x-abot-signature`。poll 传入 `bearer_token` 会拒绝。轮换 bearer 订阅时必须再提供新 token，同样不回显；hmac 订阅仍由服务端生成。
 
-生产 secrets（`DATA_MCP_TOKEN`、`SUBSCRIPTION_SEAL`、`RESEND_API_KEY`、`SCHEDULER_SECRET`）和真实 D1 `database_id` 不进入仓库。
+生产 secrets（`DATA_MCP_TOKEN`、`SUBSCRIPTION_SEAL`、`RESEND_API_KEY`、`SCHEDULER_SECRET`）和真实 D1 `database_id` 不进入仓库。普通变量 `PUBLIC_ORIGIN`（对外地址 `https://abot.run/data`）和 `WEBHOOK_DENY_DOMAINS`（webhook 禁止指向的本账户域名）由部署脚本写入，见 `deploy/ENV.md`。
 
 ## 部署
 

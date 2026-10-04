@@ -47,7 +47,7 @@ Service Binding 是网关入口。请求带合法的 `X-Abot-Owner-Email` 时按
 
 - Binding 名固定为 `DB`。
 - 表结构来自仓库根目录的 `schema.sql`，可重复执行：16 张表（`contacts`、`calendar_events`、`notes`、`events`、`event_claims`、`write_quotas`、`subscriptions`、`deliveries`、`heartbeats`、`owner_heartbeats`、`accounts`、`account_tokens`、`verification_codes`、`verification_requests`、`oauth_clients`、`oauth_codes`），18 个索引。`event_claims` 是系统事件的按账户租约，已经建好的库会在账户第一次 `poll_events` 或 `ack_event` 时补上。`write_quotas` 是鉴权后的写频率计数，第一次写操作时补上。`owner_heartbeats` 是按 owner 分开的心跳（旧 `heartbeats` 的行作为 legacy 拷入），第一次 `heartbeat` 或 cron 时补上。
-- `oauth_clients.redirect_uris` 是 JSON 数组文本，回调地址按字符串精确匹配。`client_secret_hash` 和 `oauth_codes.code_hash` 都是 SHA-256 十六进制，明文不入库。`client_secret_hash` 为空字符串表示公开客户端（不校验 secret，授权必须带 S256 PKCE）。`oauth_codes.code_challenge` 可空，存的是 S256 challenge 原文。已经建好、还没有这一列的 `oauth_codes` 会在下一次签发授权码或换 token 时自动补上。客户端行由部署方写入，本仓库没有注册接口。
+- `oauth_clients.redirect_uris` 是 JSON 数组文本，回调地址按字符串精确匹配。`client_secret_hash` 和 `oauth_codes.code_hash` 都是 SHA-256 十六进制，明文不入库。`client_secret_hash` 为空字符串表示公开客户端（不校验 secret，授权必须带 S256 PKCE）。`oauth_codes.code_challenge` 可空，存的是 S256 challenge 原文。已经建好、还没有这一列的 `oauth_codes` 会在下一次签发授权码或换 token 时自动补上。客户端可以由部署方直接写入，也可以通过动态注册 `POST /oauth/register` 创建（每个 IP 每小时 10 个，全局每小时 200 个，记录在 `oauth_client_registrations`）。
 - `contacts`、`calendar_events`、`notes` 有可空列 `owner_email`。新建库执行 `schema.sql` 即可，未写入该列的旧行保持 NULL。已经建好、还没有这一列的库要先补列（这三句只跑一次，`schema.sql` 本身不包含它们，因为重复执行 `ADD COLUMN` 会失败）：
 
 ```sql

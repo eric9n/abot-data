@@ -67,6 +67,7 @@ export function productionConfig(base, { databaseId }) {
       ],
     },
     triggers: { crons: ["*/5 * * * *"] },
+    observability: { enabled: true },
   };
 }
 
