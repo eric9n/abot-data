@@ -257,7 +257,7 @@ test("verification codes expire, lock after five misses, and can be replaced", a
     await mcp(env, "verify_account", { email: "ada@example.com", code }, { token: null, nowMs: NOW }),
   );
   assert.equal(locked.message, "too many attempts");
-  assert.equal(db.prepare("SELECT attempts FROM verification_codes").get().attempts, 6);
+  assert.equal(db.prepare("SELECT attempts FROM verification_codes").get().attempts, 5);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM accounts").get().n, 0);
 
   const expiredRequest = await requestCode(env, "bea@example.com", { ip: "203.0.113.21" });
@@ -267,7 +267,7 @@ test("verification codes expire, lock after five misses, and can be replaced", a
     await mcp(env, "verify_account", { email: "bea@example.com", code: "111111" }, { token: null, nowMs: NOW + CODE_TTL }),
   );
   assert.equal(tooLate.message, "verification code expired");
-  assert.equal(db.prepare("SELECT attempts FROM verification_codes WHERE email = 'bea@example.com'").get().attempts, 0);
+  assert.equal(db.prepare("SELECT attempts FROM verification_codes WHERE email = 'bea@example.com'").get().attempts, 1);
 
   const fresh = await requestCode(env, "bea@example.com", { ip: "203.0.113.22", nowMs: NOW + CODE_TTL });
   unwrap(fresh.rpc);
@@ -585,7 +585,7 @@ test("event bus isolates owners, system events, and dedupe keys", async () => {
   assert.equal(legacyAgain.id, legacyEv.id);
   assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(adaEv.id).owner_email, "ada@example.com");
   assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(beaEv.id).owner_email, "bea@example.com");
-  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(legacyEv.id).owner_email, null);
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(legacyEv.id).owner_email, "legacy");
   assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = 'evt_stocklegacy1'").get().owner_email, null);
   assert.equal(JSON.parse(db.prepare("SELECT payload FROM events WHERE id = ?").get(adaEv.id).payload).who, "ada");
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE dedupe_key = ?").get(shared).n, 3);
@@ -594,8 +594,12 @@ test("event bus isolates owners, system events, and dedupe keys", async () => {
     return db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE subscription_id = ?").get(id).n;
   }
   assert.equal(deliveryCount(legacyHook.id), 1);
-  assert.equal(deliveryCount(adaHook.id), 2);
-  assert.equal(deliveryCount(beaHook.id), 2);
+  assert.equal(deliveryCount(adaHook.id), 1);
+  assert.equal(deliveryCount(beaHook.id), 1);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE event_id = ? AND subscription_id = ?").get(legacyEv.id, adaHook.id).n,
+    0,
+  );
   assert.equal(
     db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE event_id = ? AND subscription_id = ?").get(beaEv.id, adaHook.id).n,
     0,
@@ -611,14 +615,14 @@ test("event bus isolates owners, system events, and dedupe keys", async () => {
   const adaPage = unwrap(
     await mcp(env, "poll_events", { subscription_id: adaPoll.id, visibility_seconds: 30 }, { token: ada.token, nowMs: NOW }),
   );
-  assert.deepEqual(whos(adaPage), ["ada", "legacy", "stock"]);
+  assert.deepEqual(whos(adaPage), ["ada", "stock"]);
   const beaPage = unwrap(
     await mcp(env, "poll_events", {
       subscription_id: beaPoll.id,
       visibility_seconds: 30,
     }, { token: bea.token, nowMs: NOW + 31000 }),
   );
-  assert.deepEqual(whos(beaPage), ["bea", "legacy", "stock"]);
+  assert.deepEqual(whos(beaPage), ["bea", "stock"]);
   const legacyPage = unwrap(
     await mcp(env, "poll_events", { subscription_id: legacyPoll.id, visibility_seconds: 30 }, { nowMs: NOW + 62000 }),
   );
@@ -656,7 +660,7 @@ test("event bus isolates owners, system events, and dedupe keys", async () => {
       visibility_seconds: 30,
     }, { token: ada.token, nowMs: NOW + 124000 }),
   );
-  assert.deepEqual(whos(medPage), ["ada", "legacy", "stock"]);
+  assert.deepEqual(whos(medPage), ["ada", "stock"]);
   assert.equal(medPage.events.some((row) => row.id === follow.id), false);
   const userPage = unwrap(
     await mcp(env, "poll_events", {
@@ -685,11 +689,11 @@ test("service binding owner email scopes requests to that account", async () => 
   const adaContact = unwrap(await mcp(env, "create_contact", { name: "Ada contact" }, { token: ada.token }));
   const beaContact = unwrap(await mcp(env, "create_contact", { name: "Bea contact" }, { token: bea.token }));
 
-  async function gwMcp(name, args, ownerEmail, extraHeaders = {}) {
+  async function gwMcp(name, args, ownerEmail, extraHeaders = {}, base = "https://backend.internal") {
     const headers = { "content-type": "application/json", ...extraHeaders };
     if (ownerEmail !== undefined) headers["x-abot-owner-email"] = ownerEmail;
     const res = await handleFetch(
-      new Request("https://abot-data.test/mcp", {
+      new Request(`${base}/mcp`, {
         method: "POST",
         headers,
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args ?? {} } }),
@@ -736,7 +740,7 @@ test("service binding owner email scopes requests to that account", async () => 
   assert.deepEqual(adaBound.sort(), [adaContact.id, bound.id].sort());
 
   const canonical = await handleFetch(
-    new Request(`https://abot-data.test/ctc/${adaContact.id}`, {
+    new Request(`https://backend.internal/ctc/${adaContact.id}`, {
       headers: { "x-abot-owner-email": "ada@example.com", "x-internal-token": "ignored" },
     }),
     env,
@@ -744,13 +748,47 @@ test("service binding owner email scopes requests to that account", async () => 
   assert.equal(canonical.status, 200);
   assert.equal((await canonical.json()).found, true);
   const hidden = await handleFetch(
-    new Request(`https://abot-data.test/ctc/${adaContact.id}`, {
+    new Request(`https://backend.internal/ctc/${adaContact.id}`, {
       headers: { "x-abot-owner-email": "bea@example.com" },
     }),
     env,
   );
   assert.equal((await hidden.json()).found, false);
+
+  // The owner header is only trusted on an internal hostname. A public
+  // hostname (route, custom domain, workers.dev) cannot impersonate anyone.
+  for (const publicBase of ["https://abot-data.test", "https://abot-data.boliam.workers.dev", "https://data.abot.run"]) {
+    assert.equal((await gwMcp("list_contacts", {}, "ada@example.com", {}, publicBase)).status, 401);
+    assert.equal(
+      (await gwMcp("list_contacts", {}, "ada@example.com", { authorization: `Bearer ${TOKEN}` }, publicBase)).status,
+      401,
+    );
+    const spoofed = await handleFetch(
+      new Request(`${publicBase}/ctc/${adaContact.id}`, { headers: { "x-abot-owner-email": "ada@example.com" } }),
+      env,
+    );
+    assert.equal(spoofed.status, 401);
+  }
 });
+
+test("record URLs use PUBLIC_ORIGIN behind the gateway", async () => {
+  const { env } = sqliteEnv();
+  env.PUBLIC_ORIGIN = "https://abot.run/data/";
+  const res = await handleFetch(
+    new Request("https://backend.internal/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "create_contact", arguments: { name: "Ada" } } }),
+    }),
+    env,
+    { nowMs: NOW },
+  );
+  const created = JSON.parse((await res.json()).result.content[0].text);
+  assert.equal(created.url, `https://abot.run/data/ctc/${created.id}`);
+  const meta = await handleFetch(new Request("https://backend.internal/.well-known/oauth-authorization-server"), env);
+  assert.equal((await meta.json()).token_endpoint, "https://abot.run/data/oauth/token");
+});
+
 
 test("an account cannot list, retarget, delete, or rotate another webhook or a legacy one", async () => {
   const { db, env } = sqliteEnv();
@@ -802,7 +840,7 @@ test("an account cannot list, retarget, delete, or rotate another webhook or a l
   assert.equal(adaAfter.secret_sealed, adaBefore.secret_sealed);
 });
 
-test("system events are leased per owner and a null webhook does not see other emits", async () => {
+test("system events are leased per owner and a legacy webhook does not see account or legacy-only emits", async () => {
   const { db, env } = sqliteEnv();
   env.SUBSCRIPTION_SEAL = Buffer.alloc(32, 9).toString("base64");
   env.DELIVER_QUEUE = { async send() {} };
@@ -820,11 +858,18 @@ test("system events are leased per owner and a null webhook does not see other e
       payload: { title: "ada private" },
     }, { token: ada.token }),
   );
-  const system = unwrap(
+  const iso = new Date(NOW).toISOString();
+  db.prepare(
+    `INSERT INTO events (
+      id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at, audience, owner_email
+    ) VALUES ('evt_systemnotic1', 'reminder.medication', '{"title":"system notice"}', 'pending', 'reminder.medication:system', ?, ?, 'emit', ?, 'bot', NULL)`,
+  ).run(iso, iso, iso);
+  const system = { id: "evt_systemnotic1" };
+  unwrap(
     await mcp(env, "emit_event", {
       type: "reminder.medication",
-      dedupe_key: "reminder.medication:system",
-      payload: { title: "system notice" },
+      dedupe_key: "reminder.medication:legacy-only",
+      payload: { title: "legacy only" },
     }),
   );
   assert.equal(
@@ -923,4 +968,135 @@ test("authenticated writes are rate limited per owner", async () => {
   assert.equal(listed.length, 2);
   unwrap(await mcp(env, "create_contact", { name: "B1" }, { token: bea.token, nowMs: NOW + 4 }));
   unwrap(await mcp(env, "create_note", { title: "later" }, { token: ada.token, nowMs: NOW + 60 * 1000 }));
+});
+
+test("heartbeats are per owner: another account cannot mask or trigger a stale alert", async () => {
+  const { db, env } = sqliteEnv();
+  db.prepare("INSERT INTO heartbeats (agent_id, seen_at, ttl_seconds, updated_at) VALUES ('bot:main', ?, 60, ?)")
+    .run(new Date(NOW - 10 * HOUR).toISOString(), new Date(NOW - 10 * HOUR).toISOString());
+  const ada = await register(env, "ada@example.com", { ip: "203.0.113.130" });
+  const bea = await register(env, "bea@example.com", { ip: "203.0.113.131" });
+  const adaPoll = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["watchdog.*"] }, { token: ada.token }));
+  const beaPoll = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["watchdog.*"] }, { token: bea.token }));
+  const legacyPoll = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["watchdog.*"] }));
+  unwrap(await mcp(env, "heartbeat", { ttl_seconds: 120 }, { token: ada.token, nowMs: NOW - HOUR }));
+  unwrap(await mcp(env, "heartbeat", { ttl_seconds: 600 }, { token: bea.token, nowMs: NOW }));
+
+  await handleScheduled({}, env, { nowMs: NOW });
+  const stale = db.prepare("SELECT owner_email FROM events WHERE type = 'watchdog.heartbeat_stale' ORDER BY owner_email").all();
+  assert.deepEqual(stale.map((row) => row.owner_email), ["ada@example.com", "legacy"]);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM owner_heartbeats WHERE owner_key = 'legacy' AND agent_id = 'bot:main'").get().n,
+    1,
+  );
+
+  const types = async (sub, token) =>
+    unwrap(await mcp(env, "poll_events", { subscription_id: sub.id }, { token, nowMs: NOW })).events.map((row) => row.type);
+  assert.deepEqual(await types(adaPoll, ada.token), ["watchdog.heartbeat_stale"]);
+  assert.deepEqual(await types(beaPoll, bea.token), []);
+  assert.deepEqual(await types(legacyPoll, undefined), ["watchdog.heartbeat_stale"]);
+});
+
+test("subscriptions are capped per owner and fan-out uses one queue batch", async () => {
+  const { env } = sqliteEnv();
+  env.SUBSCRIPTION_SEAL = Buffer.alloc(32, 4).toString("base64");
+  const batches = [];
+  env.DELIVER_QUEUE = {
+    async send() {
+      throw new Error("send should not be used when sendBatch exists");
+    },
+    async sendBatch(messages) {
+      batches.push(messages.map((m) => m.body.delivery_id));
+    },
+  };
+  const ada = await register(env, "ada@example.com", { ip: "203.0.113.140" });
+  for (let i = 0; i < 20; i++) {
+    unwrap(
+      await mcp(env, "create_subscription", { mode: "webhook", url: `https://example.com/ada/${i}`, event_types: ["*"] }, { token: ada.token }),
+    );
+  }
+  const over = rpcError(await mcp(env, "create_subscription", { mode: "poll" }, { token: ada.token }));
+  assert.equal(over.message, "subscription limit reached");
+  unwrap(await mcp(env, "create_subscription", { mode: "poll" }));
+
+  unwrap(
+    await mcp(env, "emit_event", { type: "reminder.medication", dedupe_key: "reminder.medication:many" }, { token: ada.token }),
+  );
+  assert.equal(batches.length, 1);
+  assert.equal(batches[0].length, 20);
+});
+
+test("a verification code is consumed once even when two verifies race", async () => {
+  const { db, env } = sqliteEnv();
+  const requested = await requestCode(env, "ada@example.com", { ip: "203.0.113.150" });
+  unwrap(requested.rpc);
+  const code = codeFromMail(requested.sent);
+  const results = await Promise.all([
+    mcp(env, "verify_account", { email: "ada@example.com", code }, { token: null }),
+    mcp(env, "verify_account", { email: "ada@example.com", code }, { token: null }),
+  ]);
+  const ok = results.filter((rpc) => rpc.body.error === undefined);
+  assert.equal(ok.length, 1);
+  const token = JSON.parse(ok[0].body.result.content[0].text).token;
+  assert.equal(db.prepare("SELECT token_hash FROM accounts").get().token_hash, sha256HexSync(token));
+  assert.equal(countRows(db, "verification_codes"), 0);
+});
+
+function sha256HexSync(text) {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+function countRows(db, table) {
+  return db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n;
+}
+
+test("concurrent writes and verification requests cannot overrun their limits", async () => {
+  const { db, env } = sqliteEnv();
+  const ada = await register(env, "ada@example.com", { ip: "203.0.113.160" });
+  env.WRITE_RATE_LIMIT = 3;
+  const writes = await Promise.all(
+    Array.from({ length: 6 }, (_, i) => mcp(env, "create_note", { title: `n${i}` }, { token: ada.token })),
+  );
+  assert.equal(writes.filter((rpc) => rpc.body.error === undefined).length, 3);
+  assert.equal(countRows(db, "notes"), 3);
+
+  const requests = await Promise.all(
+    Array.from({ length: 6 }, () => requestCode(env, "bea@example.com", { ip: "203.0.113.161" })),
+  );
+  assert.equal(requests.filter((r) => r.rpc.body.error === undefined).length, 3);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM verification_requests WHERE email = 'bea@example.com'").get().n,
+    3,
+  );
+  for (let i = 0; i < 10; i++) {
+    const r = await requestCode(env, "cy@example.com", { ip: `203.0.113.${180 + i}` });
+    assert.equal(r.rpc.body.error === undefined, i < 3, `request ${i}`);
+  }
+});
+
+test("an account token can only request and verify a code for its own email", async () => {
+  const { env } = sqliteEnv();
+  const ada = await register(env, "ada@example.com", { ip: "203.0.113.170" });
+  const other = await requestCode(env, "bea@example.com", { ip: "203.0.113.171", token: ada.token });
+  assert.equal(rpcError(other.rpc).message, "email must be the account email");
+  assert.equal(other.calls, 0);
+  const verifyOther = rpcError(
+    await mcp(env, "verify_account", { email: "bea@example.com", code: "123456" }, { token: ada.token }),
+  );
+  assert.equal(verifyOther.message, "email must be the account email");
+  const own = await requestCode(env, "ada@example.com", { ip: "203.0.113.172", token: ada.token });
+  assert.deepEqual(unwrap(own.rpc), { ok: true });
+});
+
+test("rule events carry the owner of the changed row", async () => {
+  const { env } = sqliteEnv();
+  const ada = await register(env, "ada@example.com", { ip: "203.0.113.190" });
+  const sent = [];
+  env.RULE_EVENTS = { async send(body) { sent.push(body); } };
+  const note = unwrap(await mcp(env, "create_note", { title: "mine" }, { token: ada.token }));
+  unwrap(await mcp(env, "create_note", { title: "legacy" }));
+  assert.deepEqual(
+    sent.map((m) => [m.type, m.owner_email, m.note_id === note.id]),
+    [["note.created", "ada@example.com", true], ["note.created", null, false]],
+  );
 });

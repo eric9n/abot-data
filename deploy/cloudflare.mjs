@@ -39,6 +39,12 @@ export function productionConfig(base, { databaseId }) {
     preview_urls: false,
     // Plain vars such as WRITE_RATE_LIMIT are managed in the dashboard.
     keep_vars: true,
+    vars: {
+      PUBLIC_ORIGIN: "https://abot.run/data",
+      // Hosts served from this Cloudflare account. A webhook there could call
+      // our own Workers with the delivery's signature or bearer.
+      WEBHOOK_DENY_DOMAINS: "abot.run,dagou.one,dagow.me,botu.dev,boliam.workers.dev",
+    },
     d1_databases: [{ binding: "DB", database_name: "abot-data", database_id: databaseId }],
     durable_objects: { bindings: [{ name: "SCHEDULER", class_name: "Scheduler" }] },
     // Declarative and compared against what is deployed. The live class is SQLite-backed.
@@ -61,7 +67,65 @@ export function productionConfig(base, { databaseId }) {
       ],
     },
     triggers: { crons: ["*/5 * * * *"] },
+    observability: { enabled: true },
   };
+}
+
+const TABLE_RE = /CREATE TABLE IF NOT EXISTS (\w+) \(([\s\S]*?)\n\);/g;
+const TABLE_CONSTRAINT = /^(PRIMARY|UNIQUE|CHECK|FOREIGN|CONSTRAINT)\b/i;
+
+/** Column definitions per table, as written in schema.sql. */
+export function schemaColumns(sql) {
+  const tables = new Map();
+  for (const [, table, body] of sql.matchAll(TABLE_RE)) {
+    const columns = [];
+    for (const raw of body.split("\n")) {
+      const line = raw.replace(/--.*$/, "").trim().replace(/,$/, "");
+      if (!line || TABLE_CONSTRAINT.test(line)) continue;
+      const name = line.match(/^(\w+)\s/);
+      if (name) columns.push({ name: name[1], def: line });
+    }
+    tables.set(table, columns);
+  }
+  return tables;
+}
+
+/**
+ * ALTER statements for columns schema.sql declares but a live table lacks.
+ * `CREATE TABLE IF NOT EXISTS` never changes an existing table, and the
+ * indexes after it fail on a missing column. Tables that do not exist yet are
+ * left to schema.sql. A column SQLite cannot add in place stops the deploy.
+ */
+export function missingColumnStatements(sql, live) {
+  const have = new Map();
+  for (const { tbl, col } of live) {
+    if (!have.has(tbl)) have.set(tbl, new Set());
+    have.get(tbl).add(col);
+  }
+  const out = [];
+  for (const [table, columns] of schemaColumns(sql)) {
+    const present = have.get(table);
+    if (!present) continue;
+    for (const { name, def } of columns) {
+      if (present.has(name)) continue;
+      const upper = def.toUpperCase();
+      if (/\b(PRIMARY KEY|UNIQUE)\b/.test(upper) || (/\bNOT NULL\b/.test(upper) && !/\bDEFAULT\b/.test(upper))) {
+        throw new Error(`${table}.${name} is missing and cannot be added in place: ${def}`);
+      }
+      out.push(`ALTER TABLE ${table} ADD COLUMN ${def};`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Live columns of the tables schema.sql owns. D1 refuses pragma_table_info on
+ * its internal _cf_KV table (SQLITE_AUTH), so this cannot join sqlite_master,
+ * and it caps compound SELECTs, so it cannot UNION one SELECT per table.
+ */
+export function liveColumnsSql(sql) {
+  const tables = JSON.stringify([...schemaColumns(sql).keys()]);
+  return `SELECT j.value AS tbl, p.name AS col FROM json_each('${tables}') j JOIN pragma_table_info(j.value) p`;
 }
 
 function fail(message) {
@@ -79,6 +143,31 @@ function wrangler(args) {
   console.log(`$ wrangler ${args.join(" ")}`);
   const res = spawnSync(WRANGLER, args, { cwd: ROOT, stdio: "inherit" });
   if (res.status !== 0) fail(`wrangler ${args[0]} failed (exit ${res.status ?? res.signal})`);
+}
+
+function wranglerJson(args) {
+  console.log(`$ wrangler ${args.join(" ")}`);
+  const res = spawnSync(WRANGLER, args, { cwd: ROOT, stdio: ["ignore", "pipe", "inherit"], encoding: "utf8" });
+  if (res.status !== 0) fail(`wrangler ${args[0]} failed (exit ${res.status ?? res.signal})`);
+  try {
+    return JSON.parse(res.stdout);
+  } catch {
+    fail(`wrangler ${args[0]} did not print JSON`);
+  }
+}
+
+function migrateColumns() {
+  const d1 = ["d1", "execute", "DB", "--remote", "--yes", "--config", OUT_CONFIG];
+  const schema = readFileSync(join(ROOT, "schema.sql"), "utf8");
+  const out = wranglerJson([...d1, "--json", "--command", liveColumnsSql(schema)]);
+  const live = (Array.isArray(out) ? out : [out]).flatMap((r) => (r && r.results) || []);
+  let statements;
+  try {
+    statements = missingColumnStatements(schema, live);
+  } catch (err) {
+    fail(err.message);
+  }
+  for (const statement of statements) wrangler([...d1, "--command", statement]);
 }
 
 function build() {
@@ -108,7 +197,8 @@ function deploy() {
     wrangler(["versions", "upload", "--config", OUT_CONFIG, "--message", message]);
     return;
   }
-  // schema.sql is idempotent; run it before the code that depends on it goes live.
+  // Both steps are idempotent and run before the code that depends on them goes live.
+  migrateColumns();
   wrangler(["d1", "execute", "DB", "--remote", "--yes", "--file", join(ROOT, "schema.sql"), "--config", OUT_CONFIG]);
   wrangler(["deploy", "--config", OUT_CONFIG, "--message", message]);
 }

@@ -1087,7 +1087,7 @@ test("audience defaults to bot, accepts user, rejects invalid values, and filter
   assert.equal(db.prepare("SELECT audience FROM events WHERE id = ?").get(again.id).audience, "user");
 });
 
-test("event owner columns migrate idempotently and keep stored rows system-scoped", async () => {
+test("event owner columns migrate idempotently, keep stored rows system-scoped, and own new legacy emits", async () => {
   const { db, env } = sqliteEnv();
   db.exec("DROP INDEX IF EXISTS idx_events_dedupe_open");
   db.exec("ALTER TABLE events DROP COLUMN owner_email");
@@ -1106,7 +1106,7 @@ test("event owner columns migrate idempotently and keep stored rows system-scope
   );
   assert.equal(created.created, true);
   assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = 'evt_legacystock1'").get().owner_email, null);
-  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(created.id).owner_email, null);
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(created.id).owner_email, "legacy");
   const again = unwrap(
     await mcp(env, "emit_event", {
       type: "reminder.followup",
@@ -1429,6 +1429,33 @@ test("subscription_deleted does not raise queue_dlq; other dead letters do once 
   await handleScheduled({}, env, { nowMs: NOW + 2000 });
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'watchdog.queue_dlq'").get().n, 1);
   assert.equal(db.prepare("SELECT status FROM events WHERE id = ?").get(ev.id).status, "pending");
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(watch[0].id).owner_email, "legacy");
+  assert.equal(db.prepare("SELECT reported_at FROM deliveries WHERE id = ?").get(keptDelivery.id).reported_at !== null, true);
+  db.prepare("UPDATE events SET status = 'acked' WHERE id = ?").run(watch[0].id);
+  await handleScheduled({}, env, { nowMs: NOW + 3000 });
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'watchdog.queue_dlq'").get().n, 1);
+});
+
+test("queue_dlq goes to the dead subscription's owner only", async () => {
+  const { db, env } = sqliteEnv();
+  const iso = NOW_ISO;
+  db.prepare(
+    `INSERT INTO subscriptions (id, mode, status, url, created_at, updated_at, owner_email)
+VALUES ('sub_adahookaaaa1', 'webhook', 'active', 'https://example.com/ada', ?, ?, 'ada@example.com')`,
+  ).run(iso, iso);
+  db.prepare(
+    `INSERT INTO events (id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at, owner_email)
+VALUES ('evt_adaeventaaa1', 'reminder.medication', '{}', 'pending', 'reminder.medication:ada', ?, ?, 'emit', ?, 'ada@example.com')`,
+  ).run(iso, iso, iso);
+  db.prepare(
+    `INSERT INTO deliveries (id, event_id, subscription_id, state, attempts, dead_reason, last_error, created_at, updated_at)
+VALUES ('dlv_adadeadaaa1', 'evt_adaeventaaa1', 'sub_adahookaaaa1', 'dead', 3, 'http_status', '500', ?, ?),
+       ('dlv_orphanaaaa1', 'evt_adaeventaaa1', 'sub_goneaaaaaaa', 'dead', 3, 'http_status', '500', ?, ?)`,
+  ).run(iso, iso, iso, iso);
+  await handleScheduled({}, env, { nowMs: NOW + 1000 });
+  const rows = db.prepare("SELECT owner_email, dedupe_key FROM events WHERE type = 'watchdog.queue_dlq'").all();
+  assert.deepEqual(rows.map((row) => ({ ...row })), [{ owner_email: "ada@example.com", dedupe_key: "watchdog.queue_dlq:dlv_adadeadaaa1" }]);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE reported_at IS NULL").get().n, 0);
 });
 
 test("the dead-letter consumer records the row and does not POST", async () => {
@@ -1810,4 +1837,185 @@ test("a subscriptions table from before webhook_auth still delivers hmac", async
   assert.equal(JSON.stringify(view).includes(sub.secret), false);
   const poll = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }));
   assert.equal(unwrap(await mcp(env, "get_subscription", { id: poll.id })).webhook_auth, "hmac");
+});
+
+test("cron expires week-old pending events and deletes month-old finished rows", async () => {
+  const { db, env } = sqliteEnv();
+  const DAY = 86_400_000;
+  const at = (ms) => new Date(ms).toISOString();
+  const insert = db.prepare(
+    `INSERT INTO events (id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at, owner_email)
+VALUES (?, 'reminder.medication', '{}', ?, ?, ?, ?, 'emit', ?, ?)`,
+  );
+  insert.run("evt_freshaaaaaa1", "pending", "k:fresh", at(NOW - DAY), at(NOW - DAY), at(NOW - DAY), "legacy");
+  insert.run("evt_oldpendinga1", "pending", "k:old", at(NOW - 8 * DAY), at(NOW - 8 * DAY), at(NOW - 8 * DAY), null);
+  insert.run("evt_oldackedaaa1", "acked", "k:acked", at(NOW - 40 * DAY), at(NOW - 40 * DAY), at(NOW - 31 * DAY), "legacy");
+  insert.run("evt_busyackedaa1", "acked", "k:busy", at(NOW - 40 * DAY), at(NOW - 40 * DAY), at(NOW - 31 * DAY), "legacy");
+  db.prepare(
+    `INSERT INTO deliveries (id, event_id, subscription_id, state, created_at, updated_at)
+VALUES ('dlv_oldpendinga1', 'evt_oldpendinga1', 'sub_xaaaaaaaaaaa', 'due', ?, ?),
+       ('dlv_oldackedaaa1', 'evt_oldackedaaa1', 'sub_xaaaaaaaaaaa', 'succeeded', ?, ?),
+       ('dlv_busyackedaa1', 'evt_busyackedaa1', 'sub_xaaaaaaaaaaa', 'due', ?, ?)`,
+  ).run(...Array(6).fill(at(NOW - 31 * DAY)));
+  db.exec(`CREATE TABLE IF NOT EXISTS event_claims (
+    event_id TEXT NOT NULL, owner_email TEXT NOT NULL, lease_token TEXT, leased_until TEXT,
+    poll_count INTEGER NOT NULL DEFAULT 0, acked_at TEXT, PRIMARY KEY (event_id, owner_email))`);
+  db.prepare("INSERT INTO event_claims (event_id, owner_email, acked_at) VALUES ('evt_oldackedaaa1', 'ada@example.com', ?)")
+    .run(at(NOW - 31 * DAY));
+  db.prepare("INSERT INTO verification_requests (id, email, ip, requested_at) VALUES ('vr1', 'a@example.com', '1', ?)")
+    .run(at(NOW - 2 * DAY));
+
+  await handleScheduled({}, env, { nowMs: NOW });
+  const status = (id) => db.prepare("SELECT status FROM events WHERE id = ?").get(id)?.status ?? null;
+  assert.equal(status("evt_freshaaaaaa1"), "pending");
+  assert.equal(status("evt_oldpendinga1"), "expired");
+  assert.equal(status("evt_oldackedaaa1"), null);
+  assert.equal(status("evt_busyackedaa1"), "acked");
+  const expiredDelivery = db.prepare("SELECT state, dead_reason, reported_at FROM deliveries WHERE id = 'dlv_oldpendinga1'").get();
+  assert.equal(expiredDelivery.state, "dead");
+  assert.equal(expiredDelivery.dead_reason, "event_expired");
+  assert.equal(expiredDelivery.reported_at, NOW_ISO);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE id = 'dlv_oldackedaaa1'").get().n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM event_claims").get().n, 0);
+  assert.equal(countOf(db, "verification_requests"), 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'watchdog.queue_dlq'").get().n, 0);
+});
+
+test("webhook urls reject local, internal, trailing-dot, and same-account hosts, also at delivery", async () => {
+  const { db, env, sent } = sqliteEnv();
+  env.WEBHOOK_DENY_DOMAINS = "abot.run, boliam.workers.dev";
+  for (const url of [
+    "https://localhost./hook",
+    "https://127.0.0.1./hook",
+    "https://0x7f000001/hook",
+    "https://[::1]/hook",
+    "https://router.lan.localdomain/hook",
+    "https://printer.home.arpa/hook",
+    "https://backend.internal./hook",
+    "https://intranet/hook",
+    "https://abot.run/data/mcp",
+    "https://ABOT.RUN./x",
+    "https://abot-data.boliam.workers.dev/mcp",
+  ]) {
+    const err = rpcError(await mcp(env, "create_subscription", { mode: "webhook", url }));
+    assert.equal(err.message, "webhook url is invalid", url);
+  }
+  const ok = unwrap(await mcp(env, "create_subscription", { mode: "webhook", url: "https://notabot.run/hook", event_types: ["*"] }));
+  unwrap(await mcp(env, "emit_event", { type: "reminder.medication", dedupe_key: "reminder.medication:deny" }));
+  assert.equal(sent.length, 1);
+
+  env.WEBHOOK_DENY_DOMAINS = "notabot.run";
+  let fetched = 0;
+  await consumeDelivery({ body: sent[0] }, env, {
+    nowMs: NOW,
+    fetch: async () => {
+      fetched += 1;
+      return new Response("", { status: 200 });
+    },
+  });
+  assert.equal(fetched, 0);
+  const row = db.prepare("SELECT state, dead_reason FROM deliveries WHERE subscription_id = ?").get(ok.id);
+  assert.equal(row.state, "dead");
+  assert.equal(row.dead_reason, "url_blocked");
+});
+
+test("a second consumer does not re-POST a delivery that is still inflight", async () => {
+  const { db, env, sent } = sqliteEnv();
+  unwrap(await mcp(env, "create_subscription", { mode: "webhook", url: "https://example.com/once", event_types: ["*"] }));
+  unwrap(await mcp(env, "emit_event", { type: "reminder.medication", dedupe_key: "reminder.medication:once" }));
+  const id = sent[0].delivery_id;
+  db.prepare("UPDATE deliveries SET state = 'inflight', inflight_at = ? WHERE id = ?").run(new Date(NOW - 60_000).toISOString(), id);
+  let posts = 0;
+  const fetch = async () => {
+    posts += 1;
+    return new Response("", { status: 200 });
+  };
+  await consumeDelivery({ body: { delivery_id: id } }, env, { nowMs: NOW, fetch });
+  assert.equal(posts, 0);
+  await consumeDelivery({ body: { delivery_id: id } }, env, { nowMs: NOW + 120_000, fetch });
+  assert.equal(posts, 1);
+  assert.equal(db.prepare("SELECT state FROM deliveries WHERE id = ?").get(id).state, "succeeded");
+});
+
+test("repeating events emit calendar.due once per occurrence", async () => {
+  const { db, env } = sqliteEnv();
+  const DAY = 86_400_000;
+  const daily = unwrap(
+    await mcp(env, "create_event", {
+      title: "Standup",
+      start_utc: "2026-09-01T01:00:00.000Z",
+      end_utc: "2026-09-01T01:15:00.000Z",
+      timezone: "Asia/Shanghai",
+      repeat: { freq: "daily", count: 40 },
+    }),
+  );
+  const stale = unwrap(
+    await mcp(env, "create_event", {
+      title: "Ended",
+      start_utc: "2026-08-01T01:00:00.000Z",
+      end_utc: "2026-08-01T02:00:00.000Z",
+      repeat: { freq: "weekly", until: "2026-08-20T00:00:00Z" },
+    }),
+  );
+  const bad = rpcError(
+    await mcp(env, "create_event", {
+      title: "x",
+      start_utc: "2026-09-01T01:00:00.000Z",
+      end_utc: "2026-09-01T02:00:00.000Z",
+      repeat: { freq: "daily", interval: 0 },
+    }),
+  );
+  assert.match(bad.message, /repeat\.interval/);
+
+  const due = () =>
+    db.prepare("SELECT dedupe_key, payload FROM events WHERE type = 'calendar.due' ORDER BY dedupe_key").all();
+  await handleScheduled({}, env, { nowMs: NOW });
+  await handleScheduled({}, env, { nowMs: NOW + 60_000 });
+  assert.deepEqual(due().map((r) => r.dedupe_key), [`calendar.due:${daily.id}:2026-09-29T01:00:00.000Z`]);
+  const payload = JSON.parse(due()[0].payload);
+  assert.equal(payload.start_utc, "2026-09-29T01:00:00.000Z");
+  assert.equal(payload.end_utc, "2026-09-29T01:15:00.000Z");
+  assert.equal(due().some((r) => r.dedupe_key.includes(stale.id)), false);
+
+  const res = await handleFetch(
+    new Request("https://abot-data.internal/internal/scheduler-due", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-scheduler-secret": "s" },
+      body: JSON.stringify({ triggers: [{ id: `calendar:${daily.id}`, type: "calendar.due", payload: { eventId: daily.id } }] }),
+    }),
+    { ...env, SCHEDULER_SECRET: "s" },
+    { nowMs: NOW + DAY },
+  );
+  assert.equal(res.status, 200);
+  assert.equal(due().length, 2);
+  assert.equal(due()[1].dedupe_key, `calendar.due:${daily.id}:2026-09-30T01:00:00.000Z`);
+
+  await handleScheduled({}, env, { nowMs: Date.parse("2026-10-15T00:00:00Z") });
+  assert.equal(due().at(-1).dedupe_key, `calendar.due:${daily.id}:2026-10-10T01:00:00.000Z`);
+  const count = due().length;
+  await handleScheduled({}, env, { nowMs: Date.parse("2026-10-20T00:00:00Z") });
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'calendar.due'").get().n, count);
+});
+
+test("creating a repeating event arms the scheduler for its next occurrence", async () => {
+  const { env } = sqliteEnv();
+  const calls = [];
+  env.SCHEDULER = {
+    idFromName: (name) => name,
+    get: () => ({
+      async schedule(id, dueMs) { calls.push(["schedule", id, new Date(dueMs).toISOString()]); },
+      async cancel(id) { calls.push(["cancel", id]); },
+    }),
+  };
+  const ev = unwrap(
+    await mcp(env, "create_event", {
+      title: "Weekly",
+      start_utc: "2026-09-01T01:00:00.000Z",
+      end_utc: "2026-09-01T02:00:00.000Z",
+      repeat: { freq: "weekly" },
+    }),
+  );
+  assert.deepEqual(calls, [["schedule", `calendar:${ev.id}`, "2026-10-06T01:00:00.000Z"]]);
+  unwrap(await mcp(env, "update_event", { id: ev.id, repeat: { freq: "none" } }));
+  assert.deepEqual(calls.at(-1), ["cancel", `calendar:${ev.id}`]);
 });

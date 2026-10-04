@@ -20,7 +20,27 @@ binding = "DB"
 database_name = "abot-data"
 database_id = "00000000-0000-0000-0000-000000000000"
 
-# Queue producer only. Consumers are part of the deploy contract, not this file.
+# Queue producers only. Consumers are part of the deploy contract, not this file.
 [[queues.producers]]
 binding = "DELIVER_QUEUE"
 queue = "abot-deliver"
+
+[[queues.producers]]
+binding = "RULE_EVENTS"
+queue = "rule-events"
+
+[[durable_objects.bindings]]
+name = "SCHEDULER"
+class_name = "Scheduler"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Scheduler"]
+
+# Scheduler hands due triggers back to this Worker through SELF.
+[[services]]
+binding = "SELF"
+service = "abot-data"
+
+[observability]
+enabled = true

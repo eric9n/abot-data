@@ -6,7 +6,7 @@ description: >-
 ---
 # abot-data
 
-个人结构化数据层 MCP：`https://data.abot.run/mcp`。Grok Bot 上 connector 名为 **Data**（`user-Data`）。参数总表见同包 [references/tools.md](references/tools.md)。
+个人结构化数据层 MCP：`https://abot.run/data/mcp`。Grok Bot 上 connector 名为 **Data**（`user-Data`）。参数总表见同包 [references/tools.md](references/tools.md)。
 
 需要具体操作时，用下面**一条一条**的 skill（和 Notion 插件同一思路），不要把本文件当万能剧本硬跑：
 

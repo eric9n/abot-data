@@ -112,6 +112,7 @@ async function postAuthorize(env, fields, opts = {}) {
       headers: {
         "content-type": "application/x-www-form-urlencoded",
         "cf-connecting-ip": opts.ip ?? "203.0.113.40",
+        ...(opts.headers ?? {}),
       },
       body: new URLSearchParams(fields),
     }),
@@ -311,7 +312,10 @@ test("oauth codes reject misuse, expiry, and reuse", async () => {
   assert.equal(again.status, 400);
   assert.deepEqual(again.body.error, { code: -32602, message: "authorization code already used" });
   assert.ok(db.prepare("SELECT used_at FROM oauth_codes WHERE email = 'bea@example.com'").get().used_at);
-  assert.equal(db.prepare("SELECT token_hash FROM accounts WHERE email = 'bea@example.com'").get().token_hash, sha256(ok.body.access_token));
+  assert.equal(
+    db.prepare("SELECT token_hash FROM account_tokens WHERE email = 'bea@example.com' AND client_id = ?").get(CLIENT).token_hash,
+    sha256(ok.body.access_token),
+  );
 });
 
 test("oauth authorization-code happy path returns the account token", async () => {
@@ -377,16 +381,29 @@ test("oauth authorization-code happy path returns the account token", async () =
   assert.match(token.body.access_token, /^ad_[0-9a-f]{32}$/);
   assert.notEqual(token.body.access_token, previousToken);
   assert.equal(
-    db.prepare("SELECT token_hash FROM accounts WHERE email = 'ada@example.com'").get().token_hash,
+    db.prepare("SELECT token_hash FROM account_tokens WHERE email = 'ada@example.com' AND client_id = ?").get(CLIENT).token_hash,
     sha256(token.body.access_token),
   );
   assert.ok(db.prepare("SELECT used_at FROM oauth_codes").get().used_at);
 
-  const stale = await mcp(env, "list_contacts", {}, { token: previousToken, nowMs: NOW + 1000 });
-  assert.equal(stale.status, 401);
+  const mainStill = await mcp(env, "list_contacts", {}, { token: previousToken, nowMs: NOW + 1000 });
+  assert.equal(mainStill.status, 200);
   const listed = await mcp(env, "list_contacts", {}, { token: token.body.access_token, nowMs: NOW + 1000 });
   assert.equal(listed.status, 200);
   assert.deepEqual(JSON.parse(listed.body.result.content[0].text), []);
+
+  const reauth = await issueAuthCode(env, "ada@example.com", { ip: "203.0.113.62", nowMs: NOW + 1500 });
+  const rotated = await exchange(
+    env,
+    { code: reauth.code, redirect_uri: REDIRECT, client_id: CLIENT, client_secret: SECRET },
+    { nowMs: NOW + 1500 },
+  );
+  assert.equal(rotated.status, 200);
+  const oldClient = await mcp(env, "list_contacts", {}, { token: token.body.access_token, nowMs: NOW + 1500 });
+  assert.equal(oldClient.status, 401);
+  const newClient = await mcp(env, "list_contacts", {}, { token: rotated.body.access_token, nowMs: NOW + 1500 });
+  assert.equal(newClient.status, 200);
+  assert.equal((await mcp(env, "list_contacts", {}, { token: previousToken, nowMs: NOW + 1500 })).status, 200);
 
   const justBefore = await issueAuthCode(env, "bea@example.com", { ip: "203.0.113.61", nowMs: NOW + 2000 });
   const stillValid = await exchange(
@@ -639,4 +656,58 @@ test("confidential client pkce still requires client_secret", async () => {
   });
   assert.equal(ok.status, 200, JSON.stringify(ok.body));
   assert.match(ok.body.access_token, /^ad_[0-9a-f]{32}$/);
+});
+
+test("the consent page cannot be framed and rejects cross-site posts", async () => {
+  const { db, env } = sqliteEnv();
+  insertClient(db, { clientId: CLIENT, secret: SECRET, redirects: [REDIRECT], name: "Evil <b>Corp</b>" });
+  const page = await handleFetch(new Request(authorizeUrl()), env, { nowMs: NOW });
+  assert.equal(page.headers.get("x-frame-options"), "DENY");
+  assert.match(page.headers.get("content-security-policy"), /frame-ancestors 'none'/);
+  const body = await page.text();
+  assert.match(body, /Evil &lt;b&gt;Corp&lt;\/b&gt;/);
+  assert.match(body, new RegExp(`<strong>${new URL(REDIRECT).host.replace(/\./g, "\\.")}</strong>`));
+
+  const { sent, fetchImpl } = mailFetch();
+  for (const headers of [
+    { "sec-fetch-site": "cross-site" },
+    { "sec-fetch-site": "same-site" },
+    { origin: "https://evil.example" },
+  ]) {
+    const res = await postAuthorize(env, { action: "send", email: "ada@example.com" }, { headers, fetch: fetchImpl });
+    assert.equal(res.status, 403, JSON.stringify(headers));
+    assert.match(await res.text(), /cross-site request rejected/);
+  }
+  assert.equal(sent.length, 0);
+  for (const headers of [{ "sec-fetch-site": "same-origin", origin: "null" }, { origin: "https://abot-data.test" }]) {
+    const ok = await postAuthorize(env, { action: "send", email: "ada@example.com" }, { headers, fetch: fetchImpl });
+    assert.equal(ok.status, 200, JSON.stringify(headers));
+  }
+  env.PUBLIC_ORIGIN = "https://abot.run/data";
+  const viaGateway = await postAuthorize(
+    env,
+    { action: "send", email: "bea@example.com" },
+    { url: authorizeUrl().replace("https://abot-data.test", "https://backend.internal"), headers: { origin: "https://abot.run" }, fetch: fetchImpl },
+  );
+  assert.equal(viaGateway.status, 200);
+});
+
+test("dynamic client registration is limited per IP", async () => {
+  const { db, env } = sqliteEnv();
+  const register = (ip) =>
+    handleFetch(
+      new Request("https://abot-data.test/oauth/register", {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": ip },
+        body: JSON.stringify({ client_name: "x", redirect_uris: ["https://client.example/cb"] }),
+      }),
+      env,
+      { nowMs: NOW },
+    );
+  for (let i = 0; i < 10; i++) assert.equal((await register("198.51.100.1")).status, 200);
+  const blocked = await readJson(await register("198.51.100.1"));
+  assert.equal(blocked.status, 400);
+  assert.equal(blocked.body.error.message, "too many client registrations");
+  assert.equal((await register("198.51.100.2")).status, 200);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM oauth_clients").get().n, 11);
 });

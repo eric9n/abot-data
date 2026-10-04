@@ -27,6 +27,7 @@ import {
   stableStringify,
   verifyWebhookRequest,
 } from "./phase2.js";
+import { assertRepeatFields, occurrenceAfter } from "./recurrence.js";
 
 export { buildWebhookBody, signWebhook, stableStringify, verifyWebhookRequest };
 export { Scheduler } from "./scheduler.js";
@@ -202,7 +203,10 @@ export function assertTimeOrder(startUtc, endUtc) {
   if (!(end > start)) throw new RpcError(-32602, "end_utc must be after start_utc");
 }
 
-/** Object or JSON text. freq must be none, daily, weekly, or monthly. */
+/**
+ * Object or JSON text. freq must be none, daily, weekly, or monthly; optional
+ * interval, until, and count are checked here and expanded in recurrence.js.
+ */
 export function normalizeRepeat(value) {
   let parsed = value;
   if (typeof value === "string") {
@@ -217,6 +221,11 @@ export function normalizeRepeat(value) {
   }
   if (typeof parsed.freq !== "string" || !REPEAT_FREQ.has(parsed.freq)) {
     throw new RpcError(-32602, "repeat.freq must be none, daily, weekly, or monthly");
+  }
+  try {
+    assertRepeatFields(parsed);
+  } catch (message) {
+    throw new RpcError(-32602, String(message));
   }
   return JSON.stringify(parsed);
 }
@@ -641,6 +650,8 @@ async function emitRuleEvent(deps, type, entityIdField, entityId) {
       type,
       at: new Date().toISOString(),
       source: "abot-data",
+      // The row's owner_email: an account email, or null for legacy rows.
+      owner_email: scopedOwner(deps),
       [entityIdField]: entityId,
     });
   } catch (e) {
@@ -662,15 +673,17 @@ async function schedulerDO(deps) {
   }
 }
 
-async function scheduleCalendarDue(deps, eventId, startUtc) {
+/** Arms the alarm for the next occurrence after now; cancels it when there is none. */
+async function scheduleCalendarDue(deps, row) {
   const stub = await schedulerDO(deps);
   if (!stub) return;
   try {
-    const dueMs = Date.parse(startUtc);
-    if (!Number.isFinite(dueMs)) return;
-    // Only schedule future events
-    if (dueMs <= Date.now()) return;
-    await stub.schedule(`calendar:${eventId}`, dueMs, "calendar.due", { eventId });
+    const dueMs = occurrenceAfter(row.start_utc, row.timezone, row.repeat, nowMsOf(deps));
+    if (dueMs == null) {
+      await stub.cancel(`calendar:${row.id}`);
+      return;
+    }
+    await stub.schedule(`calendar:${row.id}`, dueMs, "calendar.due", { eventId: row.id });
   } catch (err) {
     console.error(JSON.stringify({ msg: "scheduleCalendarDue failed", error: err && err.message }));
   }
@@ -729,7 +742,7 @@ async function createEvent(args, deps) {
   );
   const result = { id, url: canonicalUrl(deps && deps.origin, id) };
   // Schedule precise due alarm (cron remains as backfill)
-  await scheduleCalendarDue(deps, id, start);
+  await scheduleCalendarDue(deps, { id, start_utc: start, timezone, repeat });
   await emitRuleEvent(deps, "calendar.created", "calendar_id", id);
   return result;
 }
@@ -840,7 +853,7 @@ async function updateEvent(args, deps) {
   if (row.status === "cancelled") {
     await cancelCalendarDue(deps, id);
   } else if (row.start_utc) {
-    await scheduleCalendarDue(deps, id, row.start_utc);
+    await scheduleCalendarDue(deps, row);
   }
   await emitRuleEvent(deps, "calendar.updated", "calendar_id", id);
   return { found: true, ...eventView(row, deps.origin) };
@@ -996,22 +1009,34 @@ function requireAccountEmail(args) {
   return email;
 }
 
-async function assertVerificationRate(deps, email, ip, nowMs) {
+/** Reserves a verification request row before counting. Returns the row id. */
+async function reserveVerificationRequest(deps, email, ip, nowMs) {
   const since = new Date(nowMs - RATE_WINDOW_MS).toISOString();
   await queryRun(deps, "DELETE FROM verification_requests WHERE requested_at <= ?", [since]);
+  const requestId = randomRequestId();
+  const inserted = await queryFirst(
+    deps,
+    "INSERT INTO verification_requests (id, email, ip, requested_at) VALUES (?, ?, ?, ?) RETURNING rowid AS seq",
+    [requestId, email, ip, new Date(nowMs).toISOString()],
+  );
+  // Count only rows inserted at or before this one, so concurrent requests admit
+  // exactly the first N instead of all rejecting each other.
+  const seq = inserted ? inserted.seq : Number.MAX_SAFE_INTEGER;
   const emailRow = await queryFirst(
     deps,
-    "SELECT COUNT(*) AS n FROM verification_requests WHERE email = ? AND requested_at > ?",
-    [email, since],
+    "SELECT COUNT(*) AS n FROM verification_requests WHERE email = ? AND requested_at > ? AND rowid <= ?",
+    [email, since, seq],
   );
   const ipRow = await queryFirst(
     deps,
-    "SELECT COUNT(*) AS n FROM verification_requests WHERE ip = ? AND requested_at > ?",
-    [ip, since],
+    "SELECT COUNT(*) AS n FROM verification_requests WHERE ip = ? AND requested_at > ? AND rowid <= ?",
+    [ip, since, seq],
   );
-  if (countValue(emailRow) >= MAX_EMAIL_CODES || countValue(ipRow) >= MAX_IP_CODES) {
+  if (countValue(emailRow) > MAX_EMAIL_CODES || countValue(ipRow) > MAX_IP_CODES) {
+    await queryRun(deps, "DELETE FROM verification_requests WHERE id = ?", [requestId]);
     throw new RpcError(-32602, "too many verification requests");
   }
+  return requestId;
 }
 
 async function rollbackVerification(deps, email, previous, requestId) {
@@ -1064,13 +1089,20 @@ async function sendVerificationEmail(deps, email, code) {
   }
 }
 
+/** An account token may only (re)verify its own email; it cannot mint tokens for others. */
+function assertOwnAccountEmail(deps, email) {
+  if (!deps || deps.authKind !== "account") return;
+  if (scopedOwner(deps) !== email) throw new RpcError(-32602, "email must be the account email");
+}
+
 async function requestAccountVerification(args, deps) {
   requireArgs(args);
   assertOnlyKeys(args, new Set(["email"]));
   const email = requireAccountEmail(args);
+  assertOwnAccountEmail(deps, email);
   const nowMs = nowMsOf(deps);
   const ip = rateLimitIp(deps);
-  await assertVerificationRate(deps, email, ip, nowMs);
+  const requestId = await reserveVerificationRequest(deps, email, ip, nowMs);
   const previous = await queryFirst(
     deps,
     "SELECT code_hash, expires_at, attempts, requested_at FROM verification_codes WHERE email = ?",
@@ -1091,12 +1123,6 @@ async function requestAccountVerification(args, deps) {
        requested_at = excluded.requested_at`,
     [email, codeHash, expiresAt, requestedAt],
   );
-  const requestId = randomRequestId();
-  await queryRun(
-    deps,
-    "INSERT INTO verification_requests (id, email, ip, requested_at) VALUES (?, ?, ?, ?)",
-    [requestId, email, ip, requestedAt],
-  );
   try {
     await sendVerificationEmail(deps, email, code);
   } catch (err) {
@@ -1108,24 +1134,26 @@ async function requestAccountVerification(args, deps) {
   return { ok: true };
 }
 
-async function bumpCodeAttempts(deps, email) {
-  await queryRun(deps, "UPDATE verification_codes SET attempts = attempts + 1 WHERE email = ?", [email]);
-}
-
-/** Shared by verify_account and the OAuth consent page. Does not issue a token. */
-async function assertVerificationCode(deps, email, code) {
+/**
+ * Shared by verify_account and the OAuth consent page. Counts the attempt and
+ * deletes the code in separate atomic statements, so two concurrent requests
+ * cannot both pass and a failed guess is always counted. Does not issue a token.
+ */
+async function consumeVerificationCode(deps, email, code) {
   if (typeof code !== "string" || !/^\d{6}$/.test(code)) {
     throw new RpcError(-32602, "code must be a 6-digit string");
   }
   const row = await queryFirst(
     deps,
-    "SELECT code_hash, expires_at, attempts FROM verification_codes WHERE email = ?",
-    [email],
+    `UPDATE verification_codes SET attempts = attempts + 1
+     WHERE email = ? AND attempts < ?
+     RETURNING code_hash, expires_at`,
+    [email, MAX_CODE_ATTEMPTS],
   );
-  if (!row) throw new RpcError(-32602, "invalid verification code");
-  if (Number(row.attempts) >= MAX_CODE_ATTEMPTS) {
-    await bumpCodeAttempts(deps, email);
-    throw new RpcError(-32602, "too many attempts");
+  if (!row) {
+    const exists = await queryFirst(deps, "SELECT 1 AS n FROM verification_codes WHERE email = ?", [email]);
+    if (exists) throw new RpcError(-32602, "too many attempts");
+    throw new RpcError(-32602, "invalid verification code");
   }
   const expiresMs = Date.parse(row.expires_at);
   if (!Number.isFinite(expiresMs) || nowMsOf(deps) >= expiresMs) {
@@ -1133,9 +1161,13 @@ async function assertVerificationCode(deps, email, code) {
   }
   const actual = await sha256Hex(code);
   if (typeof row.code_hash !== "string" || !timingSafeEqual(actual, row.code_hash)) {
-    await bumpCodeAttempts(deps, email);
     throw new RpcError(-32602, "invalid verification code");
   }
+  const deleted = await queryRun(deps, "DELETE FROM verification_codes WHERE email = ? AND code_hash = ?", [
+    email,
+    row.code_hash,
+  ]);
+  if (changesOf(deleted) !== 1) throw new RpcError(-32602, "invalid verification code");
 }
 
 async function issueAccountToken(deps, email) {
@@ -1154,14 +1186,57 @@ async function issueAccountToken(deps, email) {
   return token;
 }
 
+async function ensureAccountTokens(deps) {
+  await queryRun(
+    deps,
+    `CREATE TABLE IF NOT EXISTS account_tokens (
+      token_hash TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`,
+    [],
+  );
+  await queryRun(
+    deps,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_account_tokens_client ON account_tokens(email, client_id)",
+    [],
+  );
+}
+
+/**
+ * One token per (email, OAuth client). Re-authorizing a client rotates only
+ * that client's token, so connecting a second connector or calling
+ * verify_account does not log the others out.
+ */
+async function issueClientToken(deps, email, clientId) {
+  const now = nowIso(deps);
+  const placeholder = await sha256Hex(newAccountToken());
+  await queryRun(
+    deps,
+    `INSERT INTO accounts (email, token_hash, created_at, verified_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(email) DO UPDATE SET verified_at = excluded.verified_at`,
+    [email, placeholder, now, now],
+  );
+  await ensureAccountTokens(deps);
+  const token = newAccountToken();
+  await queryRun(
+    deps,
+    `INSERT INTO account_tokens (token_hash, email, client_id, created_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(email, client_id) DO UPDATE SET token_hash = excluded.token_hash, created_at = excluded.created_at`,
+    [await sha256Hex(token), email, clientId, now],
+  );
+  return token;
+}
+
 async function verifyAccount(args, deps) {
   requireArgs(args);
   assertOnlyKeys(args, new Set(["email", "code"]));
   const email = requireAccountEmail(args);
+  assertOwnAccountEmail(deps, email);
   if (!has(args, "code")) throw new RpcError(-32602, "code is required");
-  await assertVerificationCode(deps, email, args.code);
+  await consumeVerificationCode(deps, email, args.code);
   const token = await issueAccountToken(deps, email);
-  await queryRun(deps, "DELETE FROM verification_codes WHERE email = ?", [email]);
   return { ok: true, token };
 }
 
@@ -1260,7 +1335,7 @@ export const TOOLS = [
   {
     name: "create_event",
     description:
-      "新建日历事件。start_utc / end_utc 为 UTC ISO8601，end 必须晚于 start。repeat.freq 为 none、daily、weekly 或 monthly。返回 {id, url}，id 前缀 cal_。不检查 attendee_ids 是否已有联系人。",
+      "新建日历事件。start_utc / end_utc 为 UTC ISO8601，end 必须晚于 start。repeat.freq 为 none、daily、weekly 或 monthly，可选 interval（1 到 366）、until（ISO8601，含当次）、count（1 到 1000）；按 timezone 的本地时间重复，每次发生各发一条 calendar.due。返回 {id, url}，id 前缀 cal_。不检查 attendee_ids 是否已有联系人。",
     inputSchema: {
       type: "object",
       properties: {
@@ -1463,21 +1538,16 @@ async function assertWriteRate(name, deps) {
   const now = nowMsOf(deps);
   const windowStart = now - (now % WRITE_WINDOW_MS);
   await ensureWriteQuotaTable(deps);
-  const row = await queryFirst(deps, "SELECT window_start, writes FROM write_quotas WHERE owner_key = ?", [owner]);
-  if (!row || Number(row.window_start) !== windowStart) {
-    await queryRun(
-      deps,
-      `INSERT INTO write_quotas (owner_key, window_start, writes) VALUES (?, ?, 1)
-       ON CONFLICT(owner_key) DO UPDATE SET window_start = excluded.window_start, writes = 1`,
-      [owner, windowStart],
-    );
-    return;
-  }
-  if (Number(row.writes) >= limit) throw new RpcError(-32602, "too many writes");
-  await queryRun(deps, "UPDATE write_quotas SET writes = writes + 1 WHERE owner_key = ? AND window_start = ?", [
-    owner,
-    windowStart,
-  ]);
+  const row = await queryFirst(
+    deps,
+    `INSERT INTO write_quotas (owner_key, window_start, writes) VALUES (?, ?, 1)
+     ON CONFLICT(owner_key) DO UPDATE SET
+       writes = CASE WHEN write_quotas.window_start = excluded.window_start THEN write_quotas.writes + 1 ELSE 1 END,
+       window_start = excluded.window_start
+     RETURNING writes`,
+    [owner, windowStart],
+  );
+  if (row && Number(row.writes) > limit) throw new RpcError(-32602, "too many writes");
 }
 
 async function callTool(name, args, deps) {
@@ -1623,6 +1693,26 @@ function json(body, status = 200) {
   });
 }
 
+/**
+ * Origin (plus optional path prefix) that clients use to reach this Worker.
+ * Behind the gateway the request URL is https://backend.internal, which is not
+ * addressable, so PUBLIC_ORIGIN (for example https://abot.run/data) wins.
+ */
+export function publicOrigin(request, env) {
+  const raw = env && typeof env.PUBLIC_ORIGIN === "string" ? env.PUBLIC_ORIGIN.trim() : "";
+  if (raw) {
+    try {
+      const url = new URL(raw);
+      if (url.protocol === "https:" && !url.search && !url.hash) {
+        return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+      }
+    } catch {
+      // Fall back to the request origin.
+    }
+  }
+  return new URL(request.url).origin;
+}
+
 function pathOf(request) {
   const url = new URL(request.url);
   if (url.pathname.length > 1 && url.pathname.endsWith("/")) return url.pathname.slice(0, -1);
@@ -1683,16 +1773,35 @@ async function readPublicAccountCall(request) {
 
 async function accountEmailForToken(env, token) {
   const hash = await sha256Hex(token);
-  const row = await d1Deps(env).queryFirst("SELECT email FROM accounts WHERE token_hash = ?", [hash]);
-  return row && typeof row.email === "string" ? row.email : null;
+  const db = d1Deps(env);
+  const row = await db.queryFirst("SELECT email FROM accounts WHERE token_hash = ?", [hash]);
+  if (row && typeof row.email === "string") return row.email;
+  let client = null;
+  try {
+    client = await db.queryFirst("SELECT email FROM account_tokens WHERE token_hash = ?", [hash]);
+  } catch (err) {
+    if (!/no such table/i.test(String(err && err.message))) throw err;
+  }
+  return client && typeof client.email === "string" ? client.email : null;
+}
+
+/**
+ * Service bindings call this Worker on a hostname of their choosing; the
+ * gateway uses backend.internal. A public route or workers.dev request always
+ * carries the public hostname, so `.internal` is never reachable from outside.
+ */
+export function isInternalRequest(request) {
+  return new URL(request.url).hostname.toLowerCase().endsWith(".internal");
 }
 
 // Service Bindings are the gateway entry. A present X-Abot-Owner-Email must
-// be a real address and scopes the call to that account. X-Internal-Token is
-// not consulted. No owner header falls through to Bearer / anonymous.
+// be a real address and scopes the call to that account. It is honored only
+// on an internal hostname; on any other hostname it is rejected. X-Internal-Token
+// is not consulted. No owner header falls through to Bearer / anonymous.
 function bindingOwnerIdentity(request) {
   const ownerHeader = request.headers.get("x-abot-owner-email");
   if (ownerHeader == null || ownerHeader === "") return null;
+  if (!isInternalRequest(request)) return { kind: "unauthorized" };
   const email = normalizeAccountEmail(ownerHeader);
   if (!email) return { kind: "unauthorized" };
   return { kind: "account", email };
@@ -1789,14 +1898,35 @@ function oauthFail(err) {
   return json({ error: { code: -32603, message: "internal error" } }, 500);
 }
 
+// No form-action: the verify POST redirects to the client's redirect_uri.
+const OAUTH_PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'";
+
 function html(body, status = 200) {
   return new Response(body, {
     status,
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
+      "content-security-policy": OAUTH_PAGE_CSP,
+      "x-frame-options": "DENY",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
     },
   });
+}
+
+/**
+ * The consent form posts to itself. The page sets no-referrer, so a genuine
+ * submit carries Origin "null" or the page's own origin; anything else, or a
+ * browser that reports a cross-site or same-site fetch, did not come from it.
+ */
+function sameOriginFormPost(request, env) {
+  const site = request.headers.get("sec-fetch-site");
+  if (site && site !== "same-origin" && site !== "none") return false;
+  const origin = request.headers.get("origin");
+  if (origin == null || origin === "null") return true;
+  const allowed = new Set([new URL(request.url).origin, new URL(publicOrigin(request, env)).origin]);
+  return allowed.has(origin);
 }
 
 function escapeHtml(value) {
@@ -2002,7 +2132,15 @@ function authorizeAction(query) {
     params.set("code_challenge_method", "S256");
   }
   if (query.loginHint) params.set("login_hint", query.loginHint);
-  return `/oauth/authorize?${params.toString()}`;
+  return `authorize?${params.toString()}`;
+}
+
+function redirectHost(uri) {
+  try {
+    return new URL(uri).host;
+  } catch {
+    return "";
+  }
 }
 
 function renderAuthorizePage(query, view) {
@@ -2031,9 +2169,9 @@ function renderAuthorizePage(query, view) {
   <p>请确认要授权的客户端和回调地址。验证通过后才会回到连接方。</p>
   <dl>
     <dt>客户端</dt>
-    <dd><code>${escapeHtml(query.clientId)}</code></dd>
+    <dd>${query.clientName ? `${escapeHtml(query.clientName)} ` : ""}<code>${escapeHtml(query.clientId)}</code></dd>
     <dt>回调地址</dt>
-    <dd><code>${escapeHtml(query.redirectUri)}</code></dd>
+    <dd><strong>${escapeHtml(redirectHost(query.redirectUri))}</strong> <code>${escapeHtml(query.redirectUri)}</code></dd>
   </dl>
   ${error}
   ${sent}
@@ -2108,9 +2246,7 @@ async function postOAuthAuthorize(request, query, runtime) {
     if (form.action === "verify") {
       const normalized = requireAccountEmail({ email: form.email });
       email = normalized;
-      await assertVerificationCode(runtime, normalized, form.code);
-      const deleted = await queryRun(runtime, "DELETE FROM verification_codes WHERE email = ?", [normalized]);
-      if (changesOf(deleted) !== 1) throw new RpcError(-32602, "invalid verification code");
+      await consumeVerificationCode(runtime, normalized, form.code);
       const code = newAuthorizationCode();
       const codeHash = await sha256Hex(code);
       const expiresAt = new Date(nowMsOf(runtime) + OAUTH_CODE_TTL_MS).toISOString();
@@ -2143,7 +2279,7 @@ async function handleSchedulerDue(request, env, deps) {
   try {
     const body = await request.json().catch(() => null);
     const triggers = body && Array.isArray(body.triggers) ? body.triggers : [];
-    const runtime = phase2.bindRuntime(env, { nowMs: deps.nowMs, origin: new URL(request.url).origin });
+    const runtime = phase2.bindRuntime(env, { nowMs: deps.nowMs, origin: publicOrigin(request, env) });
     const results = [];
     for (const t of triggers) {
       if (!t || typeof t.id !== "string") continue;
@@ -2151,6 +2287,12 @@ async function handleSchedulerDue(request, env, deps) {
         if (t.type === "calendar.due") {
           const eventId = (t.payload && t.payload.eventId) || t.id.replace(/^calendar:/, "");
           const emitted = await phase2.emitCalendarDueForEvent(runtime, eventId, "scheduler");
+          const row = await queryFirst(
+            runtime,
+            "SELECT id, start_utc, timezone, repeat, status FROM calendar_events WHERE id = ?",
+            [eventId],
+          );
+          if (row && row.status === "confirmed") await scheduleCalendarDue({ env, nowMs: deps.nowMs }, row);
           results.push({ id: t.id, emitted });
         } else {
           results.push({ id: t.id, emitted: false, reason: "unknown type" });
@@ -2177,10 +2319,14 @@ async function handleOAuthAuthorize(request, env, deps) {
     if (!clientHasSecret(client) && !query.codeChallenge) {
       throw new RpcError(-32602, "code_challenge is required");
     }
+    query.clientName = client.name || "";
     if (request.method === "GET") {
       // login_hint only prefills the form. Sending a code or issuing an
       // authorization code requires the user to submit this confirmation page.
       return html(renderAuthorizePage(query, { email: query.loginHint || "" }));
+    }
+    if (!sameOriginFormPost(request, env)) {
+      return html(renderAuthorizePage(query, { error: "cross-site request rejected" }), 403);
     }
     return postOAuthAuthorize(request, query, runtime);
   } catch (err) {
@@ -2228,6 +2374,48 @@ async function readTokenBody(request) {
   throw new RpcError(-32602, "Content-Type must be application/json or application/x-www-form-urlencoded");
 }
 
+const DCR_PER_IP_PER_HOUR = 10;
+const DCR_PER_HOUR = 200;
+
+/** Open registration: cap per IP and overall per hour so oauth_clients cannot be flooded. */
+async function reserveClientRegistration(runtime) {
+  await queryRun(
+    runtime,
+    `CREATE TABLE IF NOT EXISTS oauth_client_registrations (
+      id TEXT PRIMARY KEY,
+      ip TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`,
+    [],
+  );
+  const nowMs = nowMsOf(runtime);
+  const now = new Date(nowMs).toISOString();
+  const since = new Date(nowMs - RATE_WINDOW_MS).toISOString();
+  await queryRun(runtime, "DELETE FROM oauth_client_registrations WHERE created_at <= ?", [since]);
+  const id = randomRequestId();
+  const ip = runtime.clientIp || "unknown";
+  const inserted = await queryFirst(
+    runtime,
+    "INSERT INTO oauth_client_registrations (id, ip, created_at) VALUES (?, ?, ?) RETURNING rowid AS seq",
+    [id, ip, now],
+  );
+  const seq = inserted ? inserted.seq : Number.MAX_SAFE_INTEGER;
+  const ipRow = await queryFirst(
+    runtime,
+    "SELECT COUNT(*) AS n FROM oauth_client_registrations WHERE ip = ? AND created_at > ? AND rowid <= ?",
+    [ip, since, seq],
+  );
+  const allRow = await queryFirst(
+    runtime,
+    "SELECT COUNT(*) AS n FROM oauth_client_registrations WHERE created_at > ? AND rowid <= ?",
+    [since, seq],
+  );
+  if (countValue(ipRow) > DCR_PER_IP_PER_HOUR || countValue(allRow) > DCR_PER_HOUR) {
+    await queryRun(runtime, "DELETE FROM oauth_client_registrations WHERE id = ?", [id]);
+    throw new RpcError(-32602, "too many client registrations");
+  }
+}
+
 async function handleOAuthRegister(request, env, deps) {
   if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
   try {
@@ -2247,6 +2435,7 @@ async function handleOAuthRegister(request, env, deps) {
     }
     const clientName = typeof body.client_name === "string" ? body.client_name.slice(0, 128) : "Dynamic client";
     const runtime = oauthRuntime(env, request, deps);
+    await reserveClientRegistration(runtime);
     const rand = crypto.getRandomValues(new Uint8Array(16));
     const clientId = "dcr_" + Array.from(rand).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 24);
     const secretBytes = crypto.getRandomValues(new Uint8Array(32));
@@ -2324,7 +2513,7 @@ async function handleOAuthToken(request, env, deps) {
       [nowIso(runtime), codeHash],
     );
     if (changesOf(consumed) !== 1) throw new RpcError(-32602, "authorization code already used");
-    const token = await issueAccountToken(runtime, email);
+    const token = await issueClientToken(runtime, email, clientId);
     return json({ access_token: token, token_type: "Bearer" });
   } catch (err) {
     return oauthFail(err);
@@ -2332,13 +2521,13 @@ async function handleOAuthToken(request, env, deps) {
 }
 
 export async function handleFetch(request, env, deps = {}) {
-  const origin = new URL(request.url).origin;
+  const origin = publicOrigin(request, env);
   const path = pathOf(request);
 
   // RFC 8414: OAuth 2.0 Authorization Server Metadata
   if (path === "/.well-known/oauth-authorization-server") {
     if (request.method !== "GET") return json({ ok: false, error: "method not allowed" }, 405);
-    const base = new URL(request.url).origin;
+    const base = origin;
     return json({
       issuer: base,
       authorization_endpoint: base + "/oauth/authorize",
@@ -2355,7 +2544,7 @@ export async function handleFetch(request, env, deps = {}) {
   // RFC 9728: OAuth 2.0 Protected Resource Metadata
   if (path === "/.well-known/oauth-protected-resource") {
     if (request.method !== "GET") return json({ ok: false, error: "method not allowed" }, 405);
-    const base = new URL(request.url).origin;
+    const base = origin;
     return json({
       resource: base + "/mcp",
       authorization_servers: [base],
@@ -2377,8 +2566,8 @@ export async function handleFetch(request, env, deps = {}) {
   }
 
   // 401 with WWW-Authenticate pointing to RFC 9728 resource metadata
-  function unauthorizedMcp(request) {
-    const base = new URL(request.url).origin;
+  function unauthorizedMcp() {
+    const base = origin;
     return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), {
       status: 401,
       headers: {
@@ -2392,11 +2581,11 @@ export async function handleFetch(request, env, deps = {}) {
     if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
     let identity = await resolveBearer(request, env);
     if (identity.kind === "error") return json({ ok: false }, 500);
-    if (identity.kind === "unauthorized") return unauthorizedMcp(request);
+    if (identity.kind === "unauthorized") return unauthorizedMcp();
     let message = null;
     if (identity.kind === "anonymous") {
       message = await readPublicAccountCall(request);
-      if (!message) return unauthorizedMcp(request);
+      if (!message) return unauthorizedMcp();
       identity = { kind: "public" };
     }
     if (!message) {

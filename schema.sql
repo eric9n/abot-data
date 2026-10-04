@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
   dead_reason TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  reported_at TEXT,
   UNIQUE(event_id, subscription_id)
 );
 CREATE INDEX IF NOT EXISTS idx_deliveries_due
@@ -148,6 +149,17 @@ CREATE TABLE IF NOT EXISTS heartbeats (
   updated_at TEXT NOT NULL
 );
 
+-- Heartbeats per owner. owner_key is the account email, or "legacy".
+-- Rows in the heartbeats table above are copied in as legacy; newer rows win.
+CREATE TABLE IF NOT EXISTS owner_heartbeats (
+  owner_key TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  seen_at TEXT NOT NULL,
+  ttl_seconds INTEGER NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (owner_key, agent_id)
+);
+
 -- Agent accounts. One email, one account. Codes and tokens are stored as
 -- SHA-256 hex. owner_email above is nullable so existing rows stay NULL.
 CREATE TABLE IF NOT EXISTS accounts (
@@ -157,6 +169,16 @@ CREATE TABLE IF NOT EXISTS accounts (
   verified_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_token_hash ON accounts(token_hash);
+
+-- OAuth access tokens, one per (email, client). accounts.token_hash is the
+-- token from verify_account; the two rotate independently.
+CREATE TABLE IF NOT EXISTS account_tokens (
+  token_hash TEXT PRIMARY KEY,
+  email TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_account_tokens_client ON account_tokens(email, client_id);
 
 CREATE TABLE IF NOT EXISTS verification_codes (
   email TEXT PRIMARY KEY,

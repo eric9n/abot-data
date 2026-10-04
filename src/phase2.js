@@ -3,6 +3,8 @@
  * Appended beside Phase 1. Does not change contact / calendar / note behavior.
  */
 
+import { occurrenceAtOrBefore, parseRepeat } from "./recurrence.js";
+
 const DAY_MS = 86_400_000;
 const SCAN_LIMIT = 500;
 const DETECT_LIMIT = 50;
@@ -18,6 +20,21 @@ const CURSOR_TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const RETRY_DELAYS = [60, 120, 240];
 const DELIVER_QUEUE_NAME = "abot-deliver";
 const DLQ_QUEUE_NAME = "abot-deliver-dlq";
+/** Pending events whose not_before is older than this become 'expired'. */
+export const EVENT_TTL_MS = 7 * DAY_MS;
+/** Finished events (acked or expired) and their claims and deliveries are deleted after this. */
+export const EVENT_KEEP_MS = 30 * DAY_MS;
+const RETENTION_LIMIT = 500;
+export const MAX_SUBSCRIPTIONS_PER_ACCOUNT = 20;
+export const MAX_LEGACY_SUBSCRIPTIONS = 100;
+const QUEUE_BATCH_MAX = 100;
+const INFLIGHT_STALE_MS = 180 * 1000;
+/**
+ * Bus owner for the legacy DATA_MCP_TOKEN. Not an email address, so no account
+ * can match it. Events owned by it reach only legacy (NULL-owner) subscriptions,
+ * and the legacy caller leases system events through event_claims like an account.
+ */
+export const LEGACY_OWNER = "legacy";
 const SECRET_KEYS = new Set([
   "secret",
   "token",
@@ -249,6 +266,25 @@ function isIpAddress(host) {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
 }
 
+const BLOCKED_HOST_SUFFIXES = [".local", ".localhost", ".internal", ".localdomain", ".home.arpa", ".test", ".invalid"];
+
+/** Comma-separated WEBHOOK_DENY_DOMAINS; each entry blocks the domain and its subdomains. */
+function webhookDenyDomains(env) {
+  const raw = env && typeof env.WEBHOOK_DENY_DOMAINS === "string" ? env.WEBHOOK_DENY_DOMAINS : "";
+  return raw
+    .split(",")
+    .map((d) => d.trim().toLowerCase().replace(/^\.+|\.+$/g, ""))
+    .filter(Boolean);
+}
+
+export function webhookHostBlocked(hostname, env) {
+  const host = String(hostname).toLowerCase().replace(/\.+$/, "");
+  if (host === "" || isIpAddress(host)) return true;
+  if (host === "localhost" || !host.includes(".")) return true;
+  if (BLOCKED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return true;
+  return webhookDenyDomains(env).some((d) => host === d || host.endsWith(`.${d}`));
+}
+
 function eventTypeMatches(type, filters) {
   for (const item of filters) {
     if (item === "*") return true;
@@ -329,7 +365,7 @@ export function createPhase2(api) {
     return value;
   }
 
-  function assertWebhookUrl(value) {
+  function assertWebhookUrl(value, env) {
     if (typeof value !== "string" || value.length < 1 || value.length > 500) {
       throw new RpcError(-32602, "webhook url is invalid");
     }
@@ -344,13 +380,7 @@ export function createPhase2(api) {
       throw new RpcError(-32602, "webhook url is invalid");
     }
     if (url.port !== "" && url.port !== "443") throw new RpcError(-32602, "webhook url is invalid");
-    if (isIpAddress(host)) throw new RpcError(-32602, "webhook url is invalid");
-    if (host === "localhost" || host === "localhost.localdomain") {
-      throw new RpcError(-32602, "webhook url is invalid");
-    }
-    if (host.endsWith(".local") || host.endsWith(".localhost") || host.endsWith(".internal")) {
-      throw new RpcError(-32602, "webhook url is invalid");
-    }
+    if (webhookHostBlocked(host, env)) throw new RpcError(-32602, "webhook url is invalid");
     return value;
   }
 
@@ -469,6 +499,11 @@ export function createPhase2(api) {
     return deps.ownerEmail;
   }
 
+  /** Lease identity on the bus: the account email, or LEGACY_OWNER. */
+  function busOwner(deps) {
+    return callerOwner(deps) ?? LEGACY_OWNER;
+  }
+
   async function ensureNullableColumn(deps, table, column) {
     const rows = await queryAll(
       deps,
@@ -574,6 +609,24 @@ export function createPhase2(api) {
     await deps.sendDelivery(deliveryId);
   }
 
+  async function sendDeliveries(deps, ids, now) {
+    if (ids.length === 0) return;
+    const batched = deps && typeof deps.sendDeliveries === "function";
+    const chunk = batched ? QUEUE_BATCH_MAX : 1;
+    for (let i = 0; i < ids.length; i += chunk) {
+      const part = ids.slice(i, i + chunk);
+      try {
+        if (batched) await deps.sendDeliveries(part);
+        else await sendDelivery(deps, part[0]);
+      } catch (err) {
+        console.error(JSON.stringify({ msg: "deliver enqueue failed", delivery_ids: part, error: err && err.message }));
+        for (const id of part) {
+          await queryRun(deps, "UPDATE deliveries SET queued_at = NULL, updated_at = ? WHERE id = ?", [now, id]);
+        }
+      }
+    }
+  }
+
   async function insertDelivery(deps, eventId, subscriptionId, fields) {
     for (let attempt = 0; attempt < 5; attempt++) {
       const id = newId("dlv_");
@@ -601,18 +654,19 @@ export function createPhase2(api) {
 
   async function fanoutEvent(deps, event) {
     const ownerEmail = event.ownerEmail == null || event.ownerEmail === "" ? null : event.ownerEmail;
-    // Owned emits go only to that owner's webhooks. A NULL-owner webhook must
-    // not see them. System emits (NULL owner) still match every active webhook,
-    // which is the same set poll returns for an account plus the legacy subs.
+    // Owned emits go only to that owner's webhooks; LEGACY_OWNER emits go only
+    // to legacy (NULL-owner) webhooks. System emits (NULL owner) still match
+    // every active webhook, the same set poll returns for each caller.
     const subs = await queryAll(
       deps,
       `SELECT id, event_types FROM subscriptions
 WHERE status = 'active' AND mode = 'webhook'
-  AND (owner_email = ? OR (? IS NULL))`,
-      [ownerEmail, ownerEmail],
+  AND (? IS NULL OR owner_email = ? OR (? = ? AND (owner_email IS NULL OR owner_email = '')))`,
+      [ownerEmail, ownerEmail, ownerEmail, LEGACY_OWNER],
     );
     const nowMs = Date.parse(event.now);
     const visible = Date.parse(event.notBefore) <= nowMs;
+    const queued = [];
     for (const sub of subs) {
       if (!eventTypeMatches(event.type, parseFilters(sub.event_types))) continue;
       const queuedAt = visible ? event.now : null;
@@ -622,14 +676,9 @@ WHERE status = 'active' AND mode = 'webhook'
         queuedAt,
         now: event.now,
       });
-      if (!id || !visible) continue;
-      try {
-        await sendDelivery(deps, id);
-      } catch (err) {
-        console.error(JSON.stringify({ msg: "deliver enqueue failed", delivery_id: id, error: err && err.message }));
-        await queryRun(deps, "UPDATE deliveries SET queued_at = NULL, updated_at = ? WHERE id = ?", [event.now, id]);
-      }
+      if (id && visible) queued.push(id);
     }
+    await sendDeliveries(deps, queued, event.now);
   }
 
   async function insertBusEvent(deps, spec) {
@@ -639,6 +688,15 @@ WHERE status = 'active' AND mode = 'webhook'
     const ownerEmail = spec.ownerEmail == null || spec.ownerEmail === "" ? null : spec.ownerEmail;
     await ensureAudienceColumn(deps);
     await ensureEventOwnerIsolation(deps);
+    if (ownerEmail === LEGACY_OWNER) {
+      // Rows stored before legacy emits had an owner still dedupe legacy re-emits.
+      const stock = await queryFirst(
+        deps,
+        "SELECT id FROM events WHERE dedupe_key = ? AND status = 'pending' AND owner_email IS NULL",
+        [spec.dedupeKey],
+      );
+      if (stock) return { id: stock.id, created: false };
+    }
     for (let attempt = 0; attempt < 5; attempt++) {
       const id = newId("evt_");
       try {
@@ -687,6 +745,27 @@ WHERE status = 'active' AND mode = 'webhook'
     );
   }
 
+  async function ensureOwnerHeartbeats(deps) {
+    await queryRun(
+      deps,
+      `CREATE TABLE IF NOT EXISTS owner_heartbeats (
+        owner_key TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        seen_at TEXT NOT NULL,
+        ttl_seconds INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (owner_key, agent_id)
+      )`,
+      [],
+    );
+    await queryRun(
+      deps,
+      `INSERT OR IGNORE INTO owner_heartbeats (owner_key, agent_id, seen_at, ttl_seconds, updated_at)
+SELECT ?, agent_id, seen_at, ttl_seconds, updated_at FROM heartbeats`,
+      [LEGACY_OWNER],
+    );
+  }
+
   async function listVisible(deps, now, { after, beforeOrEqual, expiredLeaseOnly, limit, audience, owner }) {
     const where = ["status = 'pending'", "not_before <= ?"];
     const params = [now];
@@ -694,9 +773,9 @@ WHERE status = 'active' AND mode = 'webhook'
       where.push("audience = ?");
       params.push(audience);
     }
-    if (typeof owner === "string") {
+    {
       // Own rows use the event lease. System rows use event_claims so one
-      // account cannot consume the lease for every other account.
+      // caller cannot consume the lease or the ack for every other caller.
       where.push(`(
         (owner_email = ? AND (leased_until IS NULL OR leased_until <= ?))
         OR (
@@ -713,13 +792,9 @@ WHERE status = 'active' AND mode = 'webhook'
         )
       )`);
       params.push(owner, now, owner, now);
-    } else {
-      where.push("owner_email IS NULL");
-      where.push("(leased_until IS NULL OR leased_until <= ?)");
-      params.push(now);
     }
     if (expiredLeaseOnly) {
-      if (typeof owner === "string") {
+      {
         where.push(`(
           (owner_email = ? AND leased_until IS NOT NULL)
           OR (
@@ -731,8 +806,6 @@ WHERE status = 'active' AND mode = 'webhook'
           )
         )`);
         params.push(owner, owner);
-      } else {
-        where.push("leased_until IS NOT NULL");
       }
     }
     if (beforeOrEqual) {
@@ -799,7 +872,7 @@ LIMIT ?`,
 
   async function retryAfterSeconds(deps, now, filters, audience, owner) {
     const rows = [];
-    if (typeof owner === "string") {
+    {
       const ownedParams = [now, owner, now];
       let ownedAud = "";
       if (audience) {
@@ -829,21 +902,6 @@ JOIN events e ON e.id = c.event_id
 WHERE e.status = 'pending' AND e.not_before <= ? AND e.owner_email IS NULL
   AND c.owner_email = ? AND c.acked_at IS NULL AND c.leased_until IS NOT NULL AND c.leased_until > ?${claimAud}`,
           claimParams,
-        )),
-      );
-    } else {
-      const params = [now, now];
-      let extra = " AND owner_email IS NULL";
-      if (audience) {
-        extra += " AND audience = ?";
-        params.push(audience);
-      }
-      rows.push(
-        ...(await queryAll(
-          deps,
-          `SELECT type, leased_until FROM events
-WHERE status = 'pending' AND not_before <= ? AND leased_until IS NOT NULL AND leased_until > ?${extra}`,
-          params,
         )),
       );
     }
@@ -898,15 +956,16 @@ FROM subscriptions`;
     const cursor = decodeCursor(has(args, "cursor") ? args.cursor : null);
     await ensureWebhookAuthColumn(deps);
     await ensureEventOwnerIsolation(deps);
-    const owner = callerOwner(deps);
-    if (typeof owner === "string") await ensureEventClaims(deps);
+    const caller = callerOwner(deps);
+    const owner = busOwner(deps);
+    await ensureEventClaims(deps);
     const sub = await queryFirst(
       deps,
       "SELECT id, mode, status, event_types, owner_email FROM subscriptions WHERE id = ?",
       [args.subscription_id],
     );
     if (!sub) throw notFound();
-    if (!subscriptionAllowed(owner, sub.owner_email)) throw notFound();
+    if (!subscriptionAllowed(caller, sub.owner_email)) throw notFound();
     if (sub.status === "paused") throw new RpcError(-32602, "subscription paused");
     if (sub.mode !== "poll" && sub.mode !== "webhook") throw notFound();
     const filters = parseFilters(sub.event_types);
@@ -927,10 +986,9 @@ FROM subscriptions`;
     let won = [];
     if (matches.length) {
       if (!deps || typeof deps.batch !== "function") throw new Error("batch is not configured");
-      const account = typeof owner === "string";
       const results = await deps.batch(
         matches.map((row, i) => {
-          const system = account && (row.owner_email == null || row.owner_email === "");
+          const system = row.owner_email == null || row.owner_email === "";
           if (system) {
             return {
               sql: `INSERT INTO event_claims (event_id, owner_email, lease_token, leased_until, poll_count, acked_at)
@@ -944,15 +1002,12 @@ WHERE event_claims.acked_at IS NULL
               params: [row.id, owner, tokens[i], leasedUntil, now],
             };
           }
-          const params = [leasedUntil, tokens[i], now, row.id, now, now];
-          const ownerSql = account ? "AND owner_email = ?" : "AND owner_email IS NULL";
-          if (account) params.push(owner);
           return {
             sql: `UPDATE events
 SET leased_until = ?, lease_token = ?, poll_count = poll_count + 1, updated_at = ?
 WHERE id = ? AND status = 'pending' AND not_before <= ? AND (leased_until IS NULL OR leased_until <= ?)
-${ownerSql}`,
-            params,
+AND owner_email = ?`,
+            params: [leasedUntil, tokens[i], now, row.id, now, now, owner],
           };
         }),
       );
@@ -962,7 +1017,7 @@ ${ownerSql}`,
     }
     const events = [];
     for (const { row, token } of won) {
-      const system = typeof owner === "string" && (row.owner_email == null || row.owner_email === "");
+      const system = row.owner_email == null || row.owner_email === "";
       let pollCount = Number(row.poll_count) + 1;
       if (system) {
         const claim = await queryFirst(
@@ -1014,7 +1069,7 @@ ${ownerSql}`,
     }
     if (typeof args.lease_token !== "string") throw new RpcError(-32602, "lease_token is required");
     await ensureEventOwnerIsolation(deps);
-    const caller = callerOwner(deps);
+    const caller = busOwner(deps);
     const now = nowIso(deps);
     const existing = await queryFirst(
       deps,
@@ -1023,13 +1078,9 @@ ${ownerSql}`,
     );
     if (!existing) throw notFound();
     const eventOwner = existing.owner_email == null || existing.owner_email === "" ? null : existing.owner_email;
-    if (caller == null) {
-      if (eventOwner != null) throw notFound();
-    } else if (eventOwner != null && eventOwner !== caller) {
-      throw notFound();
-    }
+    if (eventOwner != null && eventOwner !== caller) throw notFound();
     const cursor = encodeCursor(existing.created_at, existing.id);
-    if (caller != null && eventOwner == null) {
+    if (eventOwner == null) {
       await ensureEventClaims(deps);
       if (LEASE_RE.test(args.lease_token)) {
         const result = await queryRun(
@@ -1051,13 +1102,12 @@ WHERE event_id = ? AND owner_email = ? AND acked_at IS NULL AND lease_token = ?`
     }
     let changes = 0;
     if (LEASE_RE.test(args.lease_token)) {
-      const bind = ownerBind(caller);
       const result = await queryRun(
         deps,
         `UPDATE events
 SET status = 'acked', acked_at = ?, leased_until = NULL, lease_token = NULL, updated_at = ?
-WHERE id = ? AND status = 'pending' AND lease_token = ? AND ${bind.clause}`,
-        [now, now, id, args.lease_token, ...bind.params],
+WHERE id = ? AND status = 'pending' AND lease_token = ? AND owner_email = ?`,
+        [now, now, id, args.lease_token, caller],
       );
       changes = changesOf(result);
     }
@@ -1073,15 +1123,16 @@ WHERE id = ? AND status = 'pending' AND lease_token = ? AND ${bind.clause}`,
     const agentId = readAgent(has(args, "agent_id") ? args.agent_id : null, "bot:main");
     const ttl = readTtl(has(args, "ttl_seconds") ? args.ttl_seconds : null);
     const now = nowIso(deps);
+    await ensureOwnerHeartbeats(deps);
     await queryRun(
       deps,
-      `INSERT INTO heartbeats (agent_id, seen_at, ttl_seconds, updated_at)
-VALUES (?, ?, ?, ?)
-ON CONFLICT(agent_id) DO UPDATE SET
+      `INSERT INTO owner_heartbeats (owner_key, agent_id, seen_at, ttl_seconds, updated_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(owner_key, agent_id) DO UPDATE SET
   seen_at = excluded.seen_at,
   ttl_seconds = excluded.ttl_seconds,
   updated_at = excluded.updated_at`,
-      [agentId, now, ttl, now],
+      [busOwner(deps), agentId, now, ttl, now],
     );
     return { agent_id: agentId, seen_at: now, ttl_seconds: ttl };
   }
@@ -1101,7 +1152,7 @@ ON CONFLICT(agent_id) DO UPDATE SET
       notBefore,
       source: "emit",
       audience,
-      ownerEmail: callerOwner(deps),
+      ownerEmail: busOwner(deps),
     });
   }
 
@@ -1120,7 +1171,7 @@ ON CONFLICT(agent_id) DO UPDATE SET
       if (has(args, "bearer_token")) throw new RpcError(-32602, "bearer_token is not allowed");
     } else {
       if (!has(args, "url") || args.url == null || args.url === "") throw new RpcError(-32602, "url is required");
-      url = assertWebhookUrl(args.url);
+      url = assertWebhookUrl(args.url, deps && deps.env);
       if (has(args, "bearer_token")) bearerToken = assertBearerToken(args.bearer_token);
     }
     const webhookAuth = bearerToken == null ? "hmac" : "bearer";
@@ -1128,6 +1179,10 @@ ON CONFLICT(agent_id) DO UPDATE SET
     await ensureEventOwnerIsolation(deps);
     const ownerEmail = callerOwner(deps);
     const now = nowIso(deps);
+    const { clause, params } = ownerBind(ownerEmail);
+    const count = await queryFirst(deps, `SELECT COUNT(*) AS n FROM subscriptions WHERE ${clause}`, params);
+    const cap = ownerEmail == null ? MAX_LEGACY_SUBSCRIPTIONS : MAX_SUBSCRIPTIONS_PER_ACCOUNT;
+    if (count && Number(count.n) >= cap) throw new RpcError(-32602, "subscription limit reached");
     for (let attempt = 0; attempt < 5; attempt++) {
       const id = newId("sub_");
       let secret = null;
@@ -1206,7 +1261,7 @@ LIMIT ?`,
     if (has(args, "url")) {
       if (existing.mode !== "webhook") throw new RpcError(-32602, "url is not allowed");
       sets.push("url = ?");
-      params.push(assertWebhookUrl(args.url));
+      params.push(assertWebhookUrl(args.url, deps && deps.env));
     }
     if (has(args, "event_types")) {
       sets.push("event_types = ?");
@@ -1327,44 +1382,64 @@ WHERE subscription_id = ? AND state IN ('due', 'inflight', 'paused')`,
     };
   }
 
-  // Emit calendar.due for one event if not already emitted (any status).
-  // Returns true if emitted, false if skipped.
-  async function emitCalendarDueForEvent(deps, eventId, source) {
-    const nowMs = nowMsOf(deps);
-    const now = new Date(nowMs).toISOString();
-    await ensureEventOwnerIsolation(deps);
-    const row = await queryFirst(
+  const CALENDAR_FIELDS = "id, title, start_utc, end_utc, timezone, all_day, location, owner_email, repeat";
+  const REPEAT_FREQ_SQL = "CASE WHEN json_valid(repeat) THEN json_extract(repeat, '$.freq') END";
+  const DUE_WINDOW_MS = 7 * DAY_MS;
+  const RECURRING_PAGE = 500;
+  const RECURRING_MAX = 5000;
+
+  function dueKey(row, occMs) {
+    const startIso = Date.parse(row.start_utc) === occMs ? row.start_utc : new Date(occMs).toISOString();
+    return { startIso, key: `calendar.due:${row.id}:${startIso}` };
+  }
+
+  /** Emits calendar.due for one occurrence unless that occurrence was already emitted (any status). */
+  async function emitDueOccurrence(deps, row, occMs, source) {
+    const { startIso, key } = dueKey(row, occMs);
+    // A row without owner is legacy data: only the legacy caller may see it.
+    const ownerEmail = row.owner_email == null || row.owner_email === "" ? LEGACY_OWNER : row.owner_email;
+    const seen = await queryFirst(
       deps,
-      `SELECT ce.id, ce.title, ce.start_utc, ce.end_utc, ce.timezone, ce.all_day, ce.location, ce.owner_email
-FROM calendar_events ce
-WHERE ce.id = ?
-  AND ce.status = 'confirmed'
-  AND ce.start_utc <= ?
-  AND NOT EXISTS (
-    SELECT 1 FROM events e
-    WHERE e.dedupe_key = 'calendar.due:' || ce.id || ':' || ce.start_utc
-      AND e.owner_email IS ce.owner_email
-  )`,
-      [eventId, now],
+      "SELECT 1 AS n FROM events WHERE dedupe_key = ? AND (owner_email IS ? OR owner_email = ?)",
+      [key, row.owner_email ?? null, ownerEmail],
     );
-    if (!row) return false;
-    const ownerEmail = row.owner_email == null || row.owner_email === "" ? null : row.owner_email;
+    if (seen) return false;
+    const duration = Math.max(0, Date.parse(row.end_utc) - Date.parse(row.start_utc)) || 0;
+    const occurrence = { ...row, start_utc: startIso, end_utc: new Date(occMs + duration).toISOString() };
     await insertBusEvent(deps, {
       type: "calendar.due",
-      dedupeKey: `calendar.due:${row.id}:${row.start_utc}`,
-      payloadText: stableStringify(await buildCalendarDuePayload(row)),
-      notBefore: now,
+      dedupeKey: key,
+      payloadText: stableStringify(await buildCalendarDuePayload(occurrence)),
+      notBefore: new Date(nowMsOf(deps)).toISOString(),
       source: source || "detector",
       ownerEmail,
     });
     return true;
   }
 
+  // Emit calendar.due for the latest occurrence of one event at or before now.
+  // A repeating event only emits an occurrence from the last 7 days.
+  // Returns true if emitted, false if skipped.
+  async function emitCalendarDueForEvent(deps, eventId, source) {
+    const nowMs = nowMsOf(deps);
+    await ensureEventOwnerIsolation(deps);
+    const row = await queryFirst(
+      deps,
+      `SELECT ${CALENDAR_FIELDS} FROM calendar_events WHERE id = ? AND status = 'confirmed'`,
+      [eventId],
+    );
+    if (!row) return false;
+    const occMs = occurrenceAtOrBefore(row.start_utc, row.timezone, row.repeat, nowMs);
+    if (occMs == null) return false;
+    if (parseRepeat(row.repeat) && occMs < nowMs - DUE_WINDOW_MS) return false;
+    return emitDueOccurrence(deps, row, occMs, source);
+  }
+
   async function detectCalendarDue(deps) {
     await ensureEventOwnerIsolation(deps);
     const nowMs = nowMsOf(deps);
     const now = new Date(nowMs).toISOString();
-    const left = new Date(nowMs - 7 * DAY_MS).toISOString();
+    const left = new Date(nowMs - DUE_WINDOW_MS).toISOString();
     const rows = await queryAll(
       deps,
       `SELECT ce.id
@@ -1372,39 +1447,65 @@ FROM calendar_events ce
 WHERE ce.status = 'confirmed'
   AND ce.start_utc <= ?
   AND ce.start_utc >= ?
+  AND COALESCE(CASE WHEN json_valid(ce.repeat) THEN json_extract(ce.repeat, '$.freq') END, 'none') NOT IN ('daily', 'weekly', 'monthly')
   AND NOT EXISTS (
     SELECT 1 FROM events e
     WHERE e.dedupe_key = 'calendar.due:' || ce.id || ':' || ce.start_utc
-      AND e.owner_email IS ce.owner_email
+      AND (e.owner_email IS ce.owner_email OR e.owner_email = COALESCE(ce.owner_email, ?))
   )
 ORDER BY ce.start_utc ASC, ce.id ASC
 LIMIT ?`,
-      [now, left, DETECT_LIMIT],
+      [now, left, LEGACY_OWNER, DETECT_LIMIT],
     );
     for (const row of rows) {
       await emitCalendarDueForEvent(deps, row.id);
     }
+    await detectRecurringDue(deps, nowMs);
+  }
+
+  async function detectRecurringDue(deps, nowMs) {
+    const now = new Date(nowMs).toISOString();
+    let after = "";
+    for (let scanned = 0; scanned < RECURRING_MAX; scanned += RECURRING_PAGE) {
+      const rows = await queryAll(
+        deps,
+        `SELECT ${CALENDAR_FIELDS} FROM calendar_events
+WHERE status = 'confirmed' AND start_utc <= ? AND id > ?
+  AND ${REPEAT_FREQ_SQL} IN ('daily', 'weekly', 'monthly')
+ORDER BY id ASC
+LIMIT ?`,
+        [now, after, RECURRING_PAGE],
+      );
+      for (const row of rows) {
+        const occMs = occurrenceAtOrBefore(row.start_utc, row.timezone, row.repeat, nowMs);
+        if (occMs != null && occMs >= nowMs - DUE_WINDOW_MS) await emitDueOccurrence(deps, row, occMs, "detector");
+      }
+      if (rows.length < RECURRING_PAGE) return;
+      after = rows[rows.length - 1].id;
+    }
+    console.error(JSON.stringify({ msg: "recurring calendar scan truncated", max: RECURRING_MAX }));
   }
 
   async function detectStaleHeartbeats(deps) {
     const nowMs = nowMsOf(deps);
     const now = new Date(nowMs).toISOString();
-    const agents = await queryAll(
+    await ensureEventOwnerIsolation(deps);
+    await ensureOwnerHeartbeats(deps);
+    const beats = await queryAll(
       deps,
-      `SELECT agent_id FROM subscriptions
-WHERE status = 'active' AND watch_heartbeat = 1
-GROUP BY agent_id
-ORDER BY agent_id ASC
+      `SELECT h.owner_key, h.agent_id, h.seen_at, h.ttl_seconds
+FROM (
+  SELECT COALESCE(NULLIF(owner_email, ''), ?) AS owner_key, agent_id
+  FROM subscriptions
+  WHERE status = 'active' AND watch_heartbeat = 1
+  GROUP BY 1, 2
+) s
+JOIN owner_heartbeats h ON h.owner_key = s.owner_key AND h.agent_id = s.agent_id
+ORDER BY h.owner_key ASC, h.agent_id ASC
 LIMIT ?`,
-      [DETECT_LIMIT],
+      [LEGACY_OWNER, DETECT_LIMIT],
     );
-    for (const agent of agents) {
-      const beat = await queryFirst(
-        deps,
-        "SELECT agent_id, seen_at, ttl_seconds FROM heartbeats WHERE agent_id = ?",
-        [agent.agent_id],
-      );
-      if (!beat) continue;
+    for (const beat of beats) {
       const seenMs = Date.parse(beat.seen_at);
       const ttl = Number(beat.ttl_seconds);
       if (Number.isNaN(seenMs) || !Number.isFinite(ttl)) continue;
@@ -1423,41 +1524,51 @@ LIMIT ?`,
         payloadText: stableStringify(payload),
         notBefore: now,
         source: "detector",
+        ownerEmail: beat.owner_key,
       });
     }
   }
 
   async function detectDeadDeliveries(deps) {
     const now = nowIso(deps);
+    await ensureEventOwnerIsolation(deps);
+    await ensureNullableColumn(deps, "deliveries", "reported_at");
     const rows = await queryAll(
       deps,
-      `SELECT id, event_id, subscription_id, attempts, dead_reason, last_error
-FROM deliveries
-WHERE state = 'dead' AND dead_reason != 'subscription_deleted'
-ORDER BY updated_at ASC, id ASC
+      `SELECT d.id, d.event_id, d.subscription_id, d.attempts, d.dead_reason, d.last_error,
+  e.type AS event_type, s.id AS sub_id, s.owner_email AS sub_owner
+FROM deliveries d
+LEFT JOIN events e ON e.id = d.event_id
+LEFT JOIN subscriptions s ON s.id = d.subscription_id
+WHERE d.state = 'dead' AND d.reported_at IS NULL
+  AND COALESCE(d.dead_reason, '') != 'subscription_deleted'
+ORDER BY d.updated_at ASC, d.id ASC
 LIMIT ?`,
       [DETECT_LIMIT],
     );
     for (const row of rows) {
-      const event = await queryFirst(deps, "SELECT id, type FROM events WHERE id = ?", [row.event_id]);
-      if (!event) continue;
-      const payload = {
-        attempts: Number(row.attempts) || 0,
-        dead_reason: row.dead_reason || "",
-        delivery_id: row.id,
-        event_id: row.event_id,
-        event_type: event.type || "",
-        last_error: row.last_error || "",
-        queue: DLQ_QUEUE_NAME,
-        subscription_id: row.subscription_id,
-      };
-      await insertBusEvent(deps, {
-        type: "watchdog.queue_dlq",
-        dedupeKey: `watchdog.queue_dlq:${row.id}`,
-        payloadText: stableStringify(payload),
-        notBefore: now,
-        source: "detector",
-      });
+      // Without the subscription there is no owner to tell; never broadcast it.
+      if (row.event_type != null && row.sub_id != null) {
+        const payload = {
+          attempts: Number(row.attempts) || 0,
+          dead_reason: row.dead_reason || "",
+          delivery_id: row.id,
+          event_id: row.event_id,
+          event_type: row.event_type || "",
+          last_error: row.last_error || "",
+          queue: DLQ_QUEUE_NAME,
+          subscription_id: row.subscription_id,
+        };
+        await insertBusEvent(deps, {
+          type: "watchdog.queue_dlq",
+          dedupeKey: `watchdog.queue_dlq:${row.id}`,
+          payloadText: stableStringify(payload),
+          notBefore: now,
+          source: "detector",
+          ownerEmail: row.sub_owner == null || row.sub_owner === "" ? LEGACY_OWNER : row.sub_owner,
+        });
+      }
+      await queryRun(deps, "UPDATE deliveries SET reported_at = ? WHERE id = ?", [now, row.id]);
     }
   }
 
@@ -1492,7 +1603,7 @@ LIMIT ?`,
   async function reclaimStuckInflight(deps) {
     const nowMs = nowMsOf(deps);
     const now = new Date(nowMs).toISOString();
-    const stuckBefore = new Date(nowMs - 180 * 1000).toISOString();
+    const stuckBefore = new Date(nowMs - INFLIGHT_STALE_MS).toISOString();
     await queryRun(
       deps,
       `UPDATE deliveries
@@ -1582,14 +1693,31 @@ WHERE id = ?`,
       }
       return { action: "ack" };
     }
+    // Another consumer may hold this row; take it over only once that attempt is stale.
+    const staleBefore = new Date(nowMs - INFLIGHT_STALE_MS).toISOString();
     const cas = await db.queryRun(
       `UPDATE deliveries SET state = 'inflight', inflight_at = ?, updated_at = ?
-WHERE id = ? AND state IN ('due', 'inflight')`,
-      [now, now, delivery.id],
+WHERE id = ? AND (
+  state = 'due'
+  OR (state = 'inflight' AND (inflight_at IS NULL OR inflight_at <= ?))
+)`,
+      [now, now, delivery.id, staleBefore],
     );
     if (changesOf(cas) !== 1) return { action: "ack" };
     if (!ctx.event) {
       await markDead(db, delivery.id, "retries_exhausted", delivery.last_error || "handler_crash", Number(delivery.attempts), now);
+      return { action: "ack" };
+    }
+    // The denylist may have grown since the subscription was created.
+    let target = null;
+    try {
+      target = new URL(sub.url);
+    } catch {
+      target = null;
+    }
+    if (!target || target.protocol !== "https:" || webhookHostBlocked(target.hostname, env)) {
+      await markDead(db, delivery.id, "url_blocked", "url_blocked", Number(delivery.attempts), now);
+      console.log(JSON.stringify({ msg: "deliver", delivery_id: delivery.id, state: "dead", last_error: "url_blocked" }));
       return { action: "ack" };
     }
     let secret;
@@ -1697,6 +1825,57 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     return { action: "ack" };
   }
 
+  async function runIgnoringMissingTable(deps, sql, params) {
+    try {
+      await queryRun(deps, sql, params);
+    } catch (err) {
+      const message = err && err.message ? String(err.message) : String(err);
+      if (/no such table/i.test(message)) return;
+      throw err;
+    }
+  }
+
+  async function applyRetention(deps) {
+    const nowMs = nowMsOf(deps);
+    const now = new Date(nowMs).toISOString();
+    const expireBefore = new Date(nowMs - EVENT_TTL_MS).toISOString();
+    const deleteBefore = new Date(nowMs - EVENT_KEEP_MS).toISOString();
+    await ensureNullableColumn(deps, "deliveries", "reported_at");
+    await ensureEventClaims(deps);
+    await queryRun(
+      deps,
+      `UPDATE events
+SET status = 'expired', leased_until = NULL, lease_token = NULL, updated_at = ?
+WHERE id IN (
+  SELECT id FROM events WHERE status = 'pending' AND not_before < ?
+  ORDER BY not_before ASC, id ASC LIMIT ?
+)`,
+      [now, expireBefore, RETENTION_LIMIT],
+    );
+    await queryRun(
+      deps,
+      `UPDATE deliveries
+SET state = 'dead', dead_reason = 'event_expired', last_error = 'event_expired', reported_at = ?, updated_at = ?
+WHERE state NOT IN ('succeeded', 'dead')
+  AND event_id IN (SELECT id FROM events WHERE status = 'expired' AND updated_at = ?)`,
+      [now, now, now],
+    );
+    const finished = `SELECT id FROM events
+WHERE status != 'pending' AND updated_at < ?
+  AND NOT EXISTS (
+    SELECT 1 FROM deliveries d WHERE d.event_id = events.id AND d.state NOT IN ('succeeded', 'dead')
+  )
+ORDER BY updated_at ASC, id ASC LIMIT ?`;
+    const finishedParams = [deleteBefore, RETENTION_LIMIT];
+    await queryRun(deps, `DELETE FROM deliveries WHERE event_id IN (${finished})`, finishedParams);
+    await queryRun(deps, `DELETE FROM event_claims WHERE event_id IN (${finished})`, finishedParams);
+    await queryRun(deps, `DELETE FROM events WHERE id IN (${finished})`, finishedParams);
+    const dayAgo = new Date(nowMs - DAY_MS).toISOString();
+    await runIgnoringMissingTable(deps, "DELETE FROM oauth_codes WHERE expires_at < ?", [dayAgo]);
+    await runIgnoringMissingTable(deps, "DELETE FROM verification_codes WHERE expires_at < ?", [dayAgo]);
+    await runIgnoringMissingTable(deps, "DELETE FROM verification_requests WHERE requested_at < ?", [dayAgo]);
+  }
+
   async function handleScheduled(_event, env, deps = {}) {
     const ctx = bindRuntime(env, deps);
     await detectCalendarDue(ctx);
@@ -1704,6 +1883,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     await detectDeadDeliveries(ctx);
     await requeueDueDeliveries(ctx);
     await reclaimStuckInflight(ctx);
+    await applyRetention(ctx);
   }
 
   async function handleQueue(batch, env, deps = {}) {
@@ -1737,6 +1917,15 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
         if (!queue || typeof queue.send !== "function") throw new Error("deliver queue is not configured");
         await queue.send({ delivery_id: deliveryId });
       },
+      async sendDeliveries(deliveryIds) {
+        const queue = env && env.DELIVER_QUEUE;
+        if (queue && typeof queue.sendBatch === "function") {
+          await queue.sendBatch(deliveryIds.map((id) => ({ body: { delivery_id: id } })));
+          return;
+        }
+        if (!queue || typeof queue.send !== "function") throw new Error("deliver queue is not configured");
+        for (const id of deliveryIds) await queue.send({ delivery_id: id });
+      },
     };
   }
 
@@ -1744,7 +1933,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     {
       name: "poll_events",
       description:
-        "按订阅认领可见的 pending 事件。cursor 只翻页，不表示完成。返回 events、next_cursor、has_more、retry_after_seconds。传入 audience 时只返回该受众，不传则返回全部。账户 token 只返回自己的事件，外加还没被该账户认领的系统事件；系统事件按账户单独租约，不会被别人的 poll 抢走。别人的订阅、以及没有 owner 的系统订阅，与不存在一样，返回 not found。legacy token 只能 poll 系统订阅，并且只看到系统事件。",
+        "按订阅认领可见的 pending 事件。cursor 只翻页，不表示完成。返回 events、next_cursor、has_more、retry_after_seconds。传入 audience 时只返回该受众，不传则返回全部。账户 token 只返回自己的事件，外加还没被该账户认领的系统事件；系统事件按账户单独租约，不会被别人的 poll 抢走。别人的订阅、以及没有 owner 的系统订阅，与不存在一样，返回 not found。legacy token 只能 poll 系统订阅，看到 legacy 写入的事件和系统事件。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1785,7 +1974,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     },
     {
       name: "emit_event",
-      description: "写入一条总线事件。拒绝 watchdog.* 和 calendar.due。新插入成功才扇出 webhook。audience 可选，只能是 bot 或 user，默认 bot。账户 token 写入的事件属于该邮箱；legacy token 写入系统事件。",
+      description: "写入一条总线事件。拒绝 watchdog.* 和 calendar.due。新插入成功才扇出 webhook。audience 可选，只能是 bot 或 user，默认 bot。账户 token 写入的事件属于该邮箱；legacy token 写入的事件属于 legacy，只有 legacy 订阅看得到。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1802,7 +1991,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     {
       name: "create_subscription",
       description:
-        "创建 poll 或 webhook 订阅。不传 bearer_token 时 webhook 用 HMAC：服务端生成 secret，只在这次响应里出现。传入 bearer_token 时投递带 Authorization: Bearer，token 不回显。bearer_token 仅 webhook 可用，1 到 500 字符，不能含控制字符或换行。订阅记下调用方邮箱；legacy token 创建的订阅没有 owner，视为系统订阅。",
+        "创建 poll 或 webhook 订阅。不传 bearer_token 时 webhook 用 HMAC：服务端生成 secret，只在这次响应里出现。传入 bearer_token 时投递带 Authorization: Bearer，token 不回显。bearer_token 仅 webhook 可用，1 到 500 字符，不能含控制字符或换行。订阅记下调用方邮箱；legacy token 创建的订阅没有 owner，视为系统订阅。每个账户最多 20 个订阅，legacy 最多 100 个，超出返回 subscription limit reached。",
       inputSchema: {
         type: "object",
         properties: {

@@ -619,7 +619,7 @@ test("e2e emit and poll filter audience and hide other owners", async () => {
   );
   assert.equal(db.prepare("SELECT owner_email, audience FROM events WHERE id = ?").get(adaBot.id).owner_email, "ada@example.com");
   assert.equal(db.prepare("SELECT audience FROM events WHERE id = ?").get(adaUser.id).audience, "user");
-  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(system.id).owner_email, null);
+  assert.equal(db.prepare("SELECT owner_email FROM events WHERE id = ?").get(system.id).owner_email, "legacy");
 
   function whos(page) {
     return page.events.map((row) => row.payload.who).sort();
@@ -627,7 +627,7 @@ test("e2e emit and poll filter audience and hide other owners", async () => {
   const adaBots = unwrap(
     await mcp(env, "poll_events", { subscription_id: adaPoll.id, audience: "bot", visibility_seconds: 30 }, { token: ada }),
   );
-  assert.deepEqual(whos(adaBots), ["ada-bot", "system-bot"]);
+  assert.deepEqual(whos(adaBots), ["ada-bot"]);
   const adaUsers = unwrap(
     await mcp(env, "poll_events", { subscription_id: adaPoll.id, audience: "user", visibility_seconds: 30 }, { token: ada, nowMs: NOW + 31000 }),
   );
@@ -635,7 +635,7 @@ test("e2e emit and poll filter audience and hide other owners", async () => {
   const beaBots = unwrap(
     await mcp(env, "poll_events", { subscription_id: beaPoll.id, audience: "bot", visibility_seconds: 30 }, { token: bea, nowMs: NOW + 62000 }),
   );
-  assert.deepEqual(whos(beaBots), ["bea-bot", "system-bot"]);
+  assert.deepEqual(whos(beaBots), ["bea-bot"]);
   assert.equal(JSON.stringify(beaBots).includes("ada-bot"), false);
   assert.equal(JSON.stringify(beaBots).includes("ada-user"), false);
   assert.equal(rpcError(await mcp(env, "poll_events", { subscription_id: adaPoll.id }, { token: bea })).message, "not found");
@@ -746,7 +746,7 @@ test("e2e calendar.due carries the calendar owner and does not leak to other acc
   assert.ok(legacyBus);
   assert.equal(adaBus.owner_email, "ada@example.com");
   assert.equal(beaBus.owner_email, "bea@example.com");
-  assert.equal(legacyBus.owner_email, null);
+  assert.equal(legacyBus.owner_email, "legacy");
   assert.equal(adaBus.source, "detector");
   assert.equal(JSON.parse(adaBus.payload).title, "Ada private visit");
   assert.equal(JSON.parse(adaBus.payload).location, "ada-clinic");
@@ -766,18 +766,20 @@ test("e2e calendar.due carries the calendar owner and does not leak to other acc
   assert.equal(beaTargets.has(beaHook.id), true);
   assert.equal(beaTargets.has(adaHook.id), false);
   assert.equal(beaTargets.has(legacyHook.id), false);
+  const legacyTargets = deliverySubs(legacyBus.id);
+  assert.deepEqual([...legacyTargets], [legacyHook.id]);
 
   const adaPage = unwrap(
     await mcp(env, "poll_events", { subscription_id: adaPoll.id, audience: "bot" }, { token: ada }),
   );
   const adaSeen = adaPage.events.map((row) => row.payload.title).sort();
-  assert.deepEqual(adaSeen, ["Ada private visit", "Legacy clinic"]);
+  assert.deepEqual(adaSeen, ["Ada private visit"]);
   assert.equal(JSON.stringify(adaPage).includes("Bea private visit"), false);
   assert.equal(JSON.stringify(adaPage).includes("bea-calendar-note-secret"), false);
   const beaPage = unwrap(
     await mcp(env, "poll_events", { subscription_id: beaPoll.id, audience: "bot" }, { token: bea, nowMs: NOW + 130000 }),
   );
-  assert.deepEqual(beaPage.events.map((row) => row.payload.title).sort(), ["Bea private visit", "Legacy clinic"]);
+  assert.deepEqual(beaPage.events.map((row) => row.payload.title).sort(), ["Bea private visit"]);
   assert.equal(JSON.stringify(beaPage).includes("Ada private visit"), false);
   assert.equal(JSON.stringify(beaPage).includes("ada-clinic"), false);
   assert.equal(JSON.stringify(beaPage).includes("ada-calendar-note-secret"), false);
