@@ -996,22 +996,35 @@ function requireAccountEmail(args) {
   return email;
 }
 
-async function assertVerificationRate(deps, email, ip, nowMs) {
+/** Reserves a verification request row before counting. Returns the row id. */
+async function reserveVerificationRequest(deps, email, ip, nowMs) {
   const since = new Date(nowMs - RATE_WINDOW_MS).toISOString();
   await queryRun(deps, "DELETE FROM verification_requests WHERE requested_at <= ?", [since]);
+  const requestId = randomRequestId();
+  const requestedAt = new Date(nowMs).toISOString();
+  await queryRun(
+    deps,
+    "INSERT INTO verification_requests (id, email, ip, requested_at) VALUES (?, ?, ?, ?)",
+    [requestId, email, ip, requestedAt],
+  );
+  // Count only rows ordered at or before this one, so concurrent requests admit
+  // exactly the first N instead of all rejecting each other.
+  const before = "requested_at > ? AND (requested_at < ? OR (requested_at = ? AND id <= ?))";
   const emailRow = await queryFirst(
     deps,
-    "SELECT COUNT(*) AS n FROM verification_requests WHERE email = ? AND requested_at > ?",
-    [email, since],
+    `SELECT COUNT(*) AS n FROM verification_requests WHERE email = ? AND ${before}`,
+    [email, since, requestedAt, requestedAt, requestId],
   );
   const ipRow = await queryFirst(
     deps,
-    "SELECT COUNT(*) AS n FROM verification_requests WHERE ip = ? AND requested_at > ?",
-    [ip, since],
+    `SELECT COUNT(*) AS n FROM verification_requests WHERE ip = ? AND ${before}`,
+    [ip, since, requestedAt, requestedAt, requestId],
   );
-  if (countValue(emailRow) >= MAX_EMAIL_CODES || countValue(ipRow) >= MAX_IP_CODES) {
+  if (countValue(emailRow) > MAX_EMAIL_CODES || countValue(ipRow) > MAX_IP_CODES) {
+    await queryRun(deps, "DELETE FROM verification_requests WHERE id = ?", [requestId]);
     throw new RpcError(-32602, "too many verification requests");
   }
+  return requestId;
 }
 
 async function rollbackVerification(deps, email, previous, requestId) {
@@ -1064,13 +1077,20 @@ async function sendVerificationEmail(deps, email, code) {
   }
 }
 
+/** An account token may only (re)verify its own email; it cannot mint tokens for others. */
+function assertOwnAccountEmail(deps, email) {
+  if (!deps || deps.authKind !== "account") return;
+  if (scopedOwner(deps) !== email) throw new RpcError(-32602, "email must be the account email");
+}
+
 async function requestAccountVerification(args, deps) {
   requireArgs(args);
   assertOnlyKeys(args, new Set(["email"]));
   const email = requireAccountEmail(args);
+  assertOwnAccountEmail(deps, email);
   const nowMs = nowMsOf(deps);
   const ip = rateLimitIp(deps);
-  await assertVerificationRate(deps, email, ip, nowMs);
+  const requestId = await reserveVerificationRequest(deps, email, ip, nowMs);
   const previous = await queryFirst(
     deps,
     "SELECT code_hash, expires_at, attempts, requested_at FROM verification_codes WHERE email = ?",
@@ -1090,12 +1110,6 @@ async function requestAccountVerification(args, deps) {
        attempts = 0,
        requested_at = excluded.requested_at`,
     [email, codeHash, expiresAt, requestedAt],
-  );
-  const requestId = randomRequestId();
-  await queryRun(
-    deps,
-    "INSERT INTO verification_requests (id, email, ip, requested_at) VALUES (?, ?, ?, ?)",
-    [requestId, email, ip, requestedAt],
   );
   try {
     await sendVerificationEmail(deps, email, code);
@@ -1164,6 +1178,7 @@ async function verifyAccount(args, deps) {
   requireArgs(args);
   assertOnlyKeys(args, new Set(["email", "code"]));
   const email = requireAccountEmail(args);
+  assertOwnAccountEmail(deps, email);
   if (!has(args, "code")) throw new RpcError(-32602, "code is required");
   await consumeVerificationCode(deps, email, args.code);
   const token = await issueAccountToken(deps, email);
@@ -1468,21 +1483,16 @@ async function assertWriteRate(name, deps) {
   const now = nowMsOf(deps);
   const windowStart = now - (now % WRITE_WINDOW_MS);
   await ensureWriteQuotaTable(deps);
-  const row = await queryFirst(deps, "SELECT window_start, writes FROM write_quotas WHERE owner_key = ?", [owner]);
-  if (!row || Number(row.window_start) !== windowStart) {
-    await queryRun(
-      deps,
-      `INSERT INTO write_quotas (owner_key, window_start, writes) VALUES (?, ?, 1)
-       ON CONFLICT(owner_key) DO UPDATE SET window_start = excluded.window_start, writes = 1`,
-      [owner, windowStart],
-    );
-    return;
-  }
-  if (Number(row.writes) >= limit) throw new RpcError(-32602, "too many writes");
-  await queryRun(deps, "UPDATE write_quotas SET writes = writes + 1 WHERE owner_key = ? AND window_start = ?", [
-    owner,
-    windowStart,
-  ]);
+  const row = await queryFirst(
+    deps,
+    `INSERT INTO write_quotas (owner_key, window_start, writes) VALUES (?, ?, 1)
+     ON CONFLICT(owner_key) DO UPDATE SET
+       writes = CASE WHEN write_quotas.window_start = excluded.window_start THEN write_quotas.writes + 1 ELSE 1 END,
+       window_start = excluded.window_start
+     RETURNING writes`,
+    [owner, windowStart],
+  );
+  if (row && Number(row.writes) > limit) throw new RpcError(-32602, "too many writes");
 }
 
 async function callTool(name, args, deps) {

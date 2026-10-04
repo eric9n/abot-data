@@ -1049,3 +1049,37 @@ function sha256HexSync(text) {
 function countRows(db, table) {
   return db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n;
 }
+
+test("concurrent writes and verification requests cannot overrun their limits", async () => {
+  const { db, env } = sqliteEnv();
+  const ada = await register(env, "ada@example.com", { ip: "203.0.113.160" });
+  env.WRITE_RATE_LIMIT = 3;
+  const writes = await Promise.all(
+    Array.from({ length: 6 }, (_, i) => mcp(env, "create_note", { title: `n${i}` }, { token: ada.token })),
+  );
+  assert.equal(writes.filter((rpc) => rpc.body.error === undefined).length, 3);
+  assert.equal(countRows(db, "notes"), 3);
+
+  const requests = await Promise.all(
+    Array.from({ length: 6 }, () => requestCode(env, "bea@example.com", { ip: "203.0.113.161" })),
+  );
+  assert.equal(requests.filter((r) => r.rpc.body.error === undefined).length, 3);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM verification_requests WHERE email = 'bea@example.com'").get().n,
+    3,
+  );
+});
+
+test("an account token can only request and verify a code for its own email", async () => {
+  const { env } = sqliteEnv();
+  const ada = await register(env, "ada@example.com", { ip: "203.0.113.170" });
+  const other = await requestCode(env, "bea@example.com", { ip: "203.0.113.171", token: ada.token });
+  assert.equal(rpcError(other.rpc).message, "email must be the account email");
+  assert.equal(other.calls, 0);
+  const verifyOther = rpcError(
+    await mcp(env, "verify_account", { email: "bea@example.com", code: "123456" }, { token: ada.token }),
+  );
+  assert.equal(verifyOther.message, "email must be the account email");
+  const own = await requestCode(env, "ada@example.com", { ip: "203.0.113.172", token: ada.token });
+  assert.deepEqual(unwrap(own.rpc), { ok: true });
+});
