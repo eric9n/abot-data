@@ -16,7 +16,7 @@
 `deploy/cloudflare.mjs` 只在 Workers Builds 里运行（检查 `WORKERS_CI=1`），在本地执行会直接退出。
 
 - `build`：从 `wrangler.toml` 取 `name`、`main`、`compatibility_date`，加上本文件的生产绑定生成 `dist/wrangler.json`（不入库），再用 `wrangler deploy --dry-run` 打包校验。测试不过不会进入这一步。
-- `deploy`，分支是 `main`：先 `wrangler d1 execute DB --remote --file schema.sql`（幂等，失败则不发布代码），再 `wrangler deploy`，版本备注是 `分支@提交 build <uuid>`。
+- `deploy`，分支是 `main`：先读线上 `schema.sql` 各表的列，对缺的列执行 `ALTER TABLE … ADD COLUMN`（`CREATE TABLE IF NOT EXISTS` 不会给旧表加列，后面的索引会因此失败；加不了的列，比如没有默认值的 `NOT NULL`，直接中止部署），再 `wrangler d1 execute DB --remote --file schema.sql`（幂等，失败则不发布代码），最后 `wrangler deploy`，版本备注是 `分支@提交 build <uuid>`。
 - `deploy`，其它分支（手动触发的构建）：只做 `wrangler versions upload`，校验绑定，不切生产流量。
 
 wrangler 版本锁在 `package.json`。Workers Builds 的 API token 除默认的 Workers Scripts 编辑权限外，还要有 **D1 Edit**（执行 schema）和 **Queues Edit**（更新 consumer）。回滚用控制台 Deployments 页选旧版本，或者 revert 后推到 `main`。
