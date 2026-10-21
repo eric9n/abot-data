@@ -326,6 +326,23 @@ test("tools/list keeps phase 1, phase 2, then the account tools", async () => {
   assert.equal(await note.text(), "");
 });
 
+test("list_contacts phone filter matches the last 11 digits", async () => {
+  const { env } = sqliteEnv();
+  const a = unwrap(await mcp(env, "create_contact", { name: "张三", phone: "+86 189-7377-5349" }));
+  const b = unwrap(await mcp(env, "create_contact", { name: "李四", phone: "010-1234, 13800000000" }));
+  unwrap(await mcp(env, "create_contact", { name: "无号码" }));
+  unwrap(await mcp(env, "create_contact", { name: "王五", phone: "13900000000" }));
+  const ids = async (args) => unwrap(await mcp(env, "list_contacts", args)).map((r) => r.id);
+  assert.deepEqual(await ids({ phone: "18973775349" }), [a.id]);
+  assert.deepEqual(await ids({ phone: "8618973775349" }), [a.id]);
+  assert.deepEqual(await ids({ phone: "+86 138 0000 0000" }), [b.id]);
+  assert.deepEqual(await ids({ phone: "13700000000" }), []);
+  assert.deepEqual(await ids({ phone: "13800000000", query: "张" }), []);
+  assert.deepEqual(await ids({ phone: "13800000000", query: "李" }), [b.id]);
+  assert.equal(rpcError(await mcp(env, "list_contacts", { phone: "12" })).code, -32602);
+  assert.equal(rpcError(await mcp(env, "list_contacts", { phone: 123 })).code, -32602);
+});
+
 test("contact tools create, read, list, update, and hard-delete", async () => {
   const { db, env } = sqliteEnv();
   const created = unwrap(

@@ -567,9 +567,15 @@ async function getContact(args, deps) {
 
 async function listContacts(args, deps) {
   requireArgs(args);
-  assertOnlyKeys(args, new Set(["query", "limit"]));
+  assertOnlyKeys(args, new Set(["query", "phone", "limit"]));
   const limit = clampLimit(args.limit, 20, 100);
   const query = optionalQuery(args.query);
+  let phoneKey = null;
+  if (args.phone !== undefined && args.phone !== null) {
+    if (typeof args.phone !== "string" || args.phone.length > 200) throw new RpcError(-32602, "phone must be a string");
+    phoneKey = phoneMatchKey(args.phone);
+    if (phoneKey.length < 5) throw new RpcError(-32602, "phone needs at least 5 digits");
+  }
   const filters = [];
   const params = [];
   const owner = scopedOwner(deps);
@@ -582,8 +588,13 @@ async function listContacts(args, deps) {
     filters.push("(name LIKE ? ESCAPE '\\' OR aliases LIKE ? ESCAPE '\\' OR IFNULL(org, '') LIKE ? ESCAPE '\\')");
     params.push(pattern, pattern, pattern);
   }
+  if (phoneKey != null) {
+    // Stored phones are free text (spaces, dashes, +86), so SQL only narrows to rows with a phone;
+    // the exact last-11-digit match runs below over at most PHONE_SCAN_LIMIT rows.
+    filters.push("phone IS NOT NULL AND phone <> ''");
+  }
   const where = filters.length ? `WHERE ${filters.join("\n  AND ")}\n` : "";
-  params.push(limit);
+  params.push(phoneKey != null ? PHONE_SCAN_LIMIT : limit);
   const rows = await queryAll(
     deps,
     `SELECT ${CONTACT_FIELDS}
@@ -592,7 +603,21 @@ ${where}ORDER BY updated_at DESC, id ASC
 LIMIT ?`,
     params,
   );
-  return rows.map((row) => contactView(row, deps.origin));
+  const matched = phoneKey != null ? rows.filter((row) => phoneMatches(row.phone, phoneKey)).slice(0, limit) : rows;
+  return matched.map((row) => contactView(row, deps.origin));
+}
+
+const PHONE_SCAN_LIMIT = 1000;
+
+/** Last 11 digits, all non-digits dropped: +86 138-0000-0000, 8613800000000 and 13800000000 compare equal. */
+export function phoneMatchKey(raw) {
+  return String(raw ?? "").replace(/\D/g, "").slice(-11);
+}
+
+/** A stored phone may hold several numbers separated by , ; / or Chinese punctuation. */
+function phoneMatches(stored, key) {
+  if (typeof stored !== "string") return false;
+  return stored.split(/[,;/、，；]/).some((part) => phoneMatchKey(part) === key);
 }
 
 async function updateContact(args, deps) {
@@ -1292,11 +1317,12 @@ export const TOOLS = [
   },
   {
     name: "list_contacts",
-    description: "列出联系人。query 对 name、aliases、org 做 LIKE。limit 默认 20，最大 100。",
+    description: "列出联系人。query 对 name、aliases、org 做 LIKE。phone 按号码末 11 位精确匹配（忽略 +86、空格、横线等非数字；可与 query 同用）。limit 默认 20，最大 100。",
     inputSchema: {
       type: "object",
       properties: {
         query: { type: "string" },
+        phone: { type: "string" },
         limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
       },
       additionalProperties: false,
