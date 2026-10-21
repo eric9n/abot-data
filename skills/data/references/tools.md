@@ -28,11 +28,12 @@
 
 ## list_contacts
 
-列出联系人。query 对 name、aliases、org 做 LIKE。limit 默认 20，最大 100。
+列出联系人。query 对 name、aliases、org 做 LIKE。phone 按号码末 11 位精确匹配（忽略 +86、空格、横线等非数字；可与 query 同用）。limit 默认 20，最大 100。
 
 参数：
 
 - `query` — string
+- `phone` — string，末 11 位匹配，至少 5 位数字
 - `limit` — integer，1–100，默认 20
 
 ## update_contact
