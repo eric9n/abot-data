@@ -4,7 +4,7 @@
 
 ## 部署流程
 
-生产发布只有一条路径：Cloudflare 控制台里 `abot-data` 的 Workers Builds（Settings > Build），连接 Origin 仓库 `dagow/abot-data`，生产分支 `main`。
+生产发布只有一条路径：Cloudflare 控制台里 `abot-data` 的 Workers Builds（Settings > Build），连接 GitHub 仓库 `eric9n/abot-data`，生产分支 `main`（2026-10-21 起；此前连的是 Origin 仓库 `dagow/abot-data`，GitHub 合并不会触发构建）。`list_contacts` 的 `phone` 参数（末 11 位匹配）随本次构建上线。
 
 | 项 | 值 |
 | --- | --- |
