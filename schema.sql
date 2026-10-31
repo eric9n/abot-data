@@ -85,6 +85,12 @@ CREATE INDEX IF NOT EXISTS idx_events_poll
   ON events(status, not_before, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_events_type_created
   ON events(type, created_at);
+-- Cron retention reads events by updated_at: finished events older than the
+-- keep window (range, ordered by updated_at, id), and events expired in this
+-- run (updated_at = now). Without this index each 5-minute run scanned the
+-- whole table, several times over.
+CREATE INDEX IF NOT EXISTS idx_events_retention
+  ON events(updated_at, id);
 
 -- Per-owner lease for system events (owner_email IS NULL). Owned events keep
 -- events.leased_until. One account's poll must not hide a system event from

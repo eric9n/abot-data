@@ -8,7 +8,7 @@ abot-data 是 bot 的个人结构化数据层，跑在 Cloudflare Workers + D1 �
 
 MCP 只做数据暴露。同步逻辑在外部组件，不在本仓库。
 
-Worker 是多模块：主模块 `src/worker.js`，辅助模块 `src/phase2.js`。D1 表结构在 `schema.sql`（16 张表、18 个索引）。投递队列是 `abot-deliver`，死信队列是 `abot-deliver-dlq`。
+Worker 是多模块：主模块 `src/worker.js`，辅助模块 `src/phase2.js`。D1 表结构在 `schema.sql`（16 张表、19 个索引）。投递队列是 `abot-deliver`，死信队列是 `abot-deliver-dlq`。
 
 - **calendar / contacts / notes**：bot 自己的日历、通讯录和笔记，不是用户个人数据的代理。`DATA_MCP_TOKEN` 仍看全部行。`ad_` 账户 token 只看 `owner_email` 等于自己的行。
 - **accounts**：一个邮箱一个 agent 账户。`request_account_verification` 和 `verify_account` 不需要 Bearer；验证码经 Resend 发出，token 只在验证成功时返回一次。
