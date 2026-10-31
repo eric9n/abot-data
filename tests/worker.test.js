@@ -2036,3 +2036,35 @@ test("creating a repeating event arms the scheduler for its next occurrence", as
   unwrap(await mcp(env, "update_event", { id: ev.id, repeat: { freq: "none" } }));
   assert.deepEqual(calls.at(-1), ["cancel", `calendar:${ev.id}`]);
 });
+
+test("cron retention finds events through an index, not a full scan of events", async () => {
+  const { db, env } = sqliteEnv();
+  const insert = db.prepare(
+    `INSERT INTO events (id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at)
+     VALUES (?, 'sms.received', '{}', ?, ?, ?, ?, 'test', ?)`,
+  );
+  const iso = (ms) => new Date(ms).toISOString();
+  const day = 24 * 3600 * 1000;
+  insert.run("evt_old", "acked", "k-old", iso(NOW - 40 * day), iso(NOW - 40 * day), iso(NOW - 31 * day));
+  insert.run("evt_recent", "acked", "k-recent", iso(NOW - 20 * day), iso(NOW - 20 * day), iso(NOW - 29 * day));
+  insert.run("evt_stale", "pending", "k-stale", iso(NOW - 8 * day), iso(NOW - 8 * day), iso(NOW - 8 * day));
+
+  const seen = [];
+  const prepare = env.DB.prepare.bind(env.DB);
+  env.DB.prepare = (sql) => {
+    seen.push(sql);
+    return prepare(sql);
+  };
+  await handleScheduled({}, env, { nowMs: NOW });
+
+  const touchingEvents = seen.filter((sql) => /\bFROM events\b/.test(sql) && /\bupdated_at\b/.test(sql));
+  assert.ok(touchingEvents.length >= 4, `retention statements seen: ${touchingEvents.length}`);
+  for (const sql of touchingEvents) {
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all();
+    const scans = plan.filter((row) => /^SCAN events\b/.test(row.detail));
+    assert.deepEqual(scans, [], `${sql}\n${plan.map((row) => row.detail).join("\n")}`);
+  }
+
+  const ids = db.prepare("SELECT id, status FROM events ORDER BY id").all().map((row) => `${row.id}:${row.status}`);
+  assert.deepEqual(ids, ["evt_recent:acked", "evt_stale:expired"]);
+});
